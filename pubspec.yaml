@@ -1,0 +1,137 @@
+name: ore_tracking
+description: "ORE Tracking - application tablette hors-ligne (reseau P2P Wi-Fi Direct)."
+# The following line prevents the package from being accidentally published to
+# pub.dev using `flutter pub publish`. This is preferred for private packages.
+publish_to: 'none' # Remove this line if you wish to publish to pub.dev
+
+# The following defines the version and build number for your application.
+# A version number is three numbers separated by dots, like 1.2.43
+# followed by an optional build number separated by a +.
+# Both the version and the builder number may be overridden in flutter
+# build by specifying --build-name and --build-number, respectively.
+# In Android, build-name is used as versionName while build-number used as versionCode.
+# Read more about Android versioning at https://developer.android.com/studio/publish/versioning
+# In iOS, build-name is used as CFBundleShortVersionString while build-number is used as CFBundleVersion.
+# Read more about iOS versioning at
+# https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
+# In Windows, build-name is used as the major, minor, and patch parts
+# of the product and file versions while build-number is used as the build suffix.
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.9.2
+
+# Dependencies specify other packages that your package needs in order to work.
+# To automatically upgrade your package dependencies to the latest versions
+# consider running `flutter pub upgrade --major-versions`. Alternatively,
+# dependencies can be manually updated by changing the version numbers below to
+# the latest version available on pub.dev. To see which dependencies have newer
+# versions available, run `flutter pub outdated`.
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # The following adds the Cupertino Icons font to your application.
+  # Use with the CupertinoIcons class for iOS style icons.
+  cupertino_icons: ^1.0.8
+
+  # Capture d'image depuis l'appareil (camera) : Picture n'est pas une case a
+  # cocher mais un bouton qui ouvre l'appareil photo.
+  image_picker: ^1.0.0
+
+  # Carte de suivi du DT : OpenStreetMap, sans cle API, sur Android et web.
+  flutter_map: ^7.0.2
+  latlong2: ^0.9.1
+  sqflite: ^2.4.2
+
+  # Couche BLE TAB 3 <-> TAB 2 (CDC §7, §8, REQ-004/005/006) :
+  # decouverte, connexions multiples cote gateway, RSSI.
+  flutter_reactive_ble: ^5.3.1
+  # Role peripherique (GATT server) pour la passerelle TAB 2 : flutter_reactive_ble
+  # ne sait qu'operer en central, le peripheral vient de ce plugin complementaire.
+  ble_peripheral: ^2.4.0
+
+  # Position GPS des tablettes (CDC §5 : la position du DT et de l'excavatrice
+  # remonte avec les evenements, c'est le serveur qui en tire la destination).
+  geolocator: ^14.0.2
+  # Conversion WGS84 -> UTM (easting/northing attendus par le serveur §5).
+  # Deja present comme dependance de flutter_map ; declare ici car importé.
+  proj4dart: ^2.1.0
+  http: ^1.6.0
+  # Base de donnees sur desktop : sqflite ne tourne qu'en mobile, la variante
+  # FFI porte le meme fichier SQLite sur Windows/Linux/macOS.
+  sqflite_common_ffi: ^2.3.7
+  # Etat reel du reseau (Wi-Fi / donnees mobiles) pour les badges d'etat :
+  # connectivity_plus couvre Android, iOS, Windows, web.
+  connectivity_plus: ^6.1.4
+  sqflite_common_ffi_web: ^1.0.2
+  # Alerte hors-parcours (echec de trajet vers la dumping area) : signal
+  # sonore + vibration a chaque mesure GPS tant que le DT sort du trajet.
+  vibration: ^3.1.8
+  audioplayers: ^6.7.1
+  flutter_screenutil: ^5.9.3
+  path_provider: ^2.1.5
+  # Demande des permissions runtime (BLE scan/connect/advertise, API 31+).
+  # Sans cet appel, l'advertising et le scan echouent silencieusement sur
+  # Android 12+ meme si le manifeste les declare : elles sont runtime.
+  permission_handler: ^11.3.1
+  flutter_tts: ^4.2.5
+  # NOTE: `package:web` (Web Speech API) est volontairement absent des
+  # dependencies classiques : il casse la compilation Android/iOS/Windows
+  # (import de dart:js_interop). Voir alerter.dart : l'import est
+  # conditionnel (web_stub.dart sur les plateformes non-web, package:web
+  # uniquement sur la cible web). Pour activer le build web, ajouter
+  # `web: ^1.1.1` dans un bloc conditionnel dedie.
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  # The "flutter_lints" package below contains a set of recommended lints to
+  # encourage good coding practices. The lint set provided by the package is
+  # activated in the `analysis_options.yaml` file located at the root of your
+  # package. See that file for information about deactivating specific lint
+  # rules and activating additional ones.
+  flutter_lints: ^5.0.0
+
+# For information on the generic Dart part of this file, see the
+# following page: https://dart.dev/tools/pub/pubspec
+
+# The following section is specific to Flutter packages.
+flutter:
+
+  # The following line ensures that the Material Icons font is
+  # included with your application, so that you can use the icons in
+  # the material Icons class.
+  uses-material-design: true
+
+  assets:
+    - assets/images/
+    - assets/images/cartes/plans/
+    - assets/sons/
+
+  # An image asset can refer to one or more resolution-specific "variants", see
+  # https://flutter.dev/to/resolution-aware-images
+
+  # For details regarding adding assets from package dependencies, see
+  # https://flutter.dev/to/asset-from-package
+
+  # To add custom fonts to your application, add a fonts section here,
+  # in this "flutter" section. Each entry in this list should have a
+  # "family" key with the font family name, and a "fonts" key with a
+  # list giving the asset and other descriptors for the font. For
+  # example:
+  # fonts:
+  #   - family: Schyler
+  #     fonts:
+  #       - asset: fonts/Schyler-Regular.ttf
+  #       - asset: fonts/Schyler-Italic.ttf
+  #         style: italic
+  #   - family: Trajan Pro
+  #     fonts:
+  #       - asset: fonts/TrajanPro.ttf
+  #       - asset: fonts/TrajanPro_Bold.ttf
+  #         weight: 700
+  #
+  # For details regarding fonts from package dependencies,
+  # see https://flutter.dev/to/font-from-package

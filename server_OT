@@ -1,0 +1,1223 @@
+/**
+ * ============================================================
+ *  ORE TRACKING — SERVEUR CENTRAL (Google Apps Script)
+ * ============================================================
+ *
+ *  Fichier : server_OT
+ *  Version protocole : 1.0 — Modele de donnees : 8.0
+ *
+ *  DEPLOIEMENT (guide complet en tete du README, voir fin de fichier) :
+ * 1. Creer un Google Spreadsheet ; les onglets sont initialises automatiquement.
+ * 2. Coller CE FICHIER dans Extensions > Apps Script.
+ * 3. Renseigner CONFIG (ID du Spreadsheet, dossier Drive, TOKEN).
+ * 4. Renseigner les onglets `profils`, `equipements` et `dts`.
+ * 5. Deployer en Web App : Execute as Me, Who has access Anyone.
+ * 6. Configurer sur les tablettes `api_base` (URL + /exec) et `api_token`.
+ *
+ * ============================================================
+ *  DIVERGENCES DE CONTRAT (CDC SERVEUR.md vs Apps Script)
+ * ============================================================
+ *  Apps Script ne livre ni les en-tetes HTTP ni les codes de statut.
+ *  Toute reponse sort donc en HTTP 200 avec un marqueur explicite :
+ *
+ *      { "ok": true,  ... }  = equivaut 202 (ACK) / 409 (DOUBLON) / 404 vide
+ *      { "ok": false, "erreur": "..." } = equivaut 400/401/422/5xx (rejouable)
+ *
+ *  Cote client, TransmetteurHttp lit `ok` en PLUS du code HTTP.
+ *  Cote auth : les en-tetes (Authorization, X-Protocol-Version) sont
+ *  invisibles — le jeton voyage en parametre de requete ?token=...,
+ *  toujours sur HTTPS (deploiement Web App).
+ *  Endpoints (route par parametre ?action=... car le chemin Apps Script
+ *  est fixe) :
+ *      POST ?action=evenement   { enveloppe CDC §12 }
+ *      GET  ?action=affectation
+ *      GET  ?action=blasts
+ *      GET  ?action=referentiels       (profils, equipements et DT)
+ *      GET  ?action=plan&carte=<code>  (streaming de l'image depuis Drive ;
+ *                                        <code> = nom de fichier sans extension)
+ *      GET  ?action=sante              (diagnostic deploiement)
+ */
+
+// ============================================================
+//  CONFIG — a remplir apres creation du Spreadsheet
+// ============================================================
+
+const CONFIG = {
+  /** ID du Spreadsheet (dans son URL : /d/ID/edit) */
+  SPREADSHEET_ID: 'METTRE_ID_DU_SPREADSHEET',
+
+  /** Jeton partage avec les tablettes (meta.api_token cote client) */
+  TOKEN: 'METTRE_UN_JETON_LONG_ET_ALEATOIRE',
+
+  /** Version de protocole acceptee (X-Protocol-Version → verifie dans le corps) */
+  VERSION_PROTOCOLE: '1.0',
+
+  /** ID du dossier Drive contenant les plans des cartes (JPG) */
+  DOSSIER_PLANS_ID: 'METTRE_ID_DU_DOSSIER_PLANS',
+
+  /** Fichier GeoJSON des pistes du site (Trails.geojson), pour le parcours */
+  FICHIER_PISTES_ID: 'METTRE_ID_DU_GEOJSON',
+
+  /** Cache du calcul de parcours : duree en secondes */
+  CACHE_PARCOURS_S: 60,
+
+  /** Noms des onglets du Spreadsheet */
+  ONGLETS: {
+    EVENEMENTS: 'evenements',
+    AFFECTATION: 'affectation',
+    BLASTS: 'blasts',
+    BLOCS: 'blocs',
+    CARTES: 'cartes',
+    POSITIONS: 'positions',
+    JOURNAL: 'journal',
+    NOTIFICATIONS: 'notifications',
+    PROFILS: 'profils',
+    EQUIPEMENTS: 'equipements',
+    DTS: 'dts',
+  },
+};
+
+// ============================================================
+//  INITIALISATION — le serveur cree lui-meme ses onglets
+// ============================================================
+
+/**
+ * Schemas des onglets : noms de colonnes poses en ligne 1. `evenements`
+ * n'a pas d'entete (chaque ligne est un evenement, le balayage d'event_id
+ * ne suppose pas de titre) ; les autres ont une ligne d'entete lue par
+ * lireTable/lireCleValeur.
+ */
+const SCHEMAS = {
+  affectation: ['cle', 'valeur'],
+  blasts: ['numero', 'carte'],
+  // `carte` dans `blocs` permet de regrouper les blocs par RL : un blast peut
+  // couvrir plusieurs cartes (une par RL = premier segment du code), et chaque
+  // bloc est rattache a l'une d'elles. Cela remplace l'ancien modele
+  // implicite « un blast = une carte ».
+  blocs: ['blast', 'numero', 'carte'],
+  // `code` reste la cle unique de jointure (blasts.carte -> cartes.code) et
+  // correspond au NOM DU FICHIER SANS EXTENSION dans le dossier Drive.
+  // Les colonnes suivantes eclatent la nomenclature pour l'exploitation :
+  // 232.5_OM_LWP2_235_230_106 = flitch 232.5, activite OM (Overburden Mining),
+  // site LWP2, profondeur 235 -> 230, pattern 106.
+  cartes: [
+    'code', 'libelle', 'flitch', 'activite', 'site',
+    'prof_debut', 'prof_fin', 'pattern',
+  ],
+  // Coordonnees metriques UTM du depot et des destinations. Le calcul du
+  // parcours traite chaque valeur comme une paire [easting, northing].
+  positions: ['code', 'easting', 'northing'],
+  journal: ['horodatage', 'message'],
+  notifications: ['id', 'profil', 'message', 'horodatage'],
+  profils: ['code', 'libelle', 'titre', 'role_cdc', 'icone', 'ordre', 'actif'],
+  equipements: ['profil', 'id', 'nom', 'actif'],
+  dts: ['type', 'id', 'actif'],
+  // evenements : sans entete, colonnes imposees par l'ordre d'appendRow.
+};
+
+const COLONNES_EVENEMENTS = [
+  'event_id', 'gateway_id', 'source_device', 'event_type', 'timestamp',
+  'received_at', 'payload', 'easting', 'northing',
+];
+
+/**
+ * Cree les onglets manquants du Spreadsheet, avec leur entete quand il en
+ * faut une. Idempotent : un onglet existant n'est jamais touche (ni ses
+ * donnees, ni son entete), on ne comble que les absents.
+ *
+ * Appele automatiquement par doGet/doPost (leger : une lecture de noms, une
+ * insertion seulement si manquant) et executable a la main depuis l'editeur
+ * (fonction initialiser) pour verifier le deploiement.
+ */
+function initialiser() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  // evenements : jamais d'entete, mais une colonne vide tient lieu de tete
+  // de fichier — on ne pose une ligne d'exemple QUE si la feuille est vide.
+  if (!ss.getSheetByName(CONFIG.ONGLETS.EVENEMENTS)) {
+    const sh = ss.insertSheet(CONFIG.ONGLETS.EVENEMENTS);
+    // Pas d'entete ecrite : la ligne 1 accueillera le premier evenement.
+    sh.getRange(1, 1, 1, COLONNES_EVENEMENTS.length).setBackground('#f3f3f3');
+  } else {
+    const sh = ss.getSheetByName(CONFIG.ONGLETS.EVENEMENTS);
+    if (sh.getLastRow() === 0) {
+      sh.getRange(1, 1, 1, COLONNES_EVENEMENTS.length).setBackground('#f3f3f3');
+    }
+  }
+
+  for (const [cle, entete] of Object.entries(SCHEMAS)) {
+    const nom = CONFIG.ONGLETS[cle.toUpperCase()] || cle;
+    let sh = ss.getSheetByName(nom);
+    if (!sh) {
+      sh = ss.insertSheet(nom);
+      sh.getRange(1, 1, 1, entete.length).setValues([entete]).setFontWeight('bold');
+      sh.setFrozenRows(1);
+      continue;
+    }
+    if (!entete.length) continue;
+    // Onglet deja present : on complete l'entete si elle est vide ou si des
+    // colonnes du schema manquent a la suite (ex. `cartes` passe de 2 a 8
+    // colonnes). On n'ecrase JAMAIS une colonne existante : les donnees en
+    // place restent alignees sur leur entete. Aucune ligne de donnee n'est
+    // touchee — on n'ecrit que la ligne 1.
+    const actuels = sh.getLastColumn()
+      ? sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0]
+          .map((v) => String(v).trim())
+      : [];
+    const manquants = [];
+    for (let i = 0; i < entete.length; i++) {
+      if (actuels[i] !== entete[i]) { manquants.push({ index: i, nom: entete[i] }); }
+    }
+    if (!manquants.length) continue;
+    // Reecrit la ligne 1 en entier quand elle est vide ou incompatible ; sinon
+    // n'ajoute que les colonnes absentes a la fin.
+    if (sh.getLastRow() === 0 || !actuels.some((v) => v !== '')) {
+      sh.getRange(1, 1, 1, entete.length).setValues([entete]).setFontWeight('bold');
+      sh.setFrozenRows(1);
+    } else {
+      sh.getRange(1, actuels.length + 1, 1, manquants.length)
+        .setValues([manquants.map((m) => m.nom)]).setFontWeight('bold');
+    }
+  }
+}
+
+/** Point d'entree manuel (menu Run de l'editeur Apps Script). */
+function initialiserOnglets() {
+  initialiser();
+  Logger.log('Onglets verifies : ' + Object.values(CONFIG.ONGLETS).join(', '));
+}
+
+// ============================================================
+//  ROUTEUR
+// ============================================================
+
+function doGet(e) {
+  return reponse(function () {
+    initialiser(); // cree les onglets manquants (idempotent, leger)
+    const p = e.parameter || {};
+    verifierToken(p.token);
+    switch (p.action) {
+      case 'affectation':  return affectationLire();
+      case 'blasts':       return blastsLire();
+      case 'referentiels': return referentielsLire();
+      case 'plan':         return planServir(p.carte || '');
+      case 'sante':        return sante();
+      case 'notifications': return notificationsLire(p.depuis);
+      default:
+        return corps(false, 'action inconnue : ' + (p.action || '(absente)'));
+    }
+  }, true /* binaire possible */);
+}
+
+function doPost(e) {
+  return reponse(function () {
+    initialiser(); // cree les onglets manquants (idempotent, leger)
+    const p = e.parameter || {};
+    verifierToken(p.token);
+    if (p.action === 'evenement') {
+      return evenementTraiter(e.postData ? e.postData.contents : '');
+    }
+    if (p.action === 'notification') {
+      return notificationEcrire(e.postData ? e.postData.contents : '');
+    }
+    return corps(false, 'action POST inconnue : ' + (p.action || '(absente)'));
+  });
+}
+
+/** Enveloppe chaque handler : une exception sort en ok:false, jamais en page d'erreur. */
+function reponse(traitement, binairePossible) {
+  try {
+    const valeur = traitement();
+    // ContentService n'est pas une fonction constructeur : `instanceof` sur le
+    // global jette « Right-hand side of 'instanceof' is not callable ». On
+    // reconnait un TextOutput deja construit (reponse binaire/plan) a sa forme.
+    if (valeur && typeof valeur.getContent === 'function' && typeof valeur !== 'string') {
+      return valeur;
+    }
+    return ContentService
+      .createTextOutput(JSON.stringify(valeur))
+      .setMimeType(ContentService.MimeType.JSON);
+  } catch (erreur) {
+    if (binairePossible && erreur instanceof ReponseBinaire) return erreur.sortie;
+    return ContentService
+      .createTextOutput(JSON.stringify({ ok: false, erreur: String(erreur) }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+/** Exception intermediaire pour livrer un binaire (plan JPG) via doGet. */
+function ReponseBinaire(sortie) { this.sortie = sortie; }
+
+/** Corps JSON standard : tout passe par le marqueur ok. */
+function corps(ok, ...champs) {
+  // corps(true, {cle: valeur}) ou corps(false, 'message') — les deux formes.
+  if (typeof ok !== 'object' && champs.length === 1 && typeof champs[0] === 'string') {
+    return { ok: ok, erreur: champs[0] };
+  }
+  const objet = { ok: true };
+  for (const c of champs) if (c && typeof c === 'object') Object.assign(objet, c);
+  return objet;
+}
+
+// ============================================================
+//  AUTH — jeton en parametre de requete (en-tetes invisibles sur GAS)
+// ============================================================
+
+function verifierToken(recu) {
+  if (!recu || recu !== CONFIG.TOKEN) {
+    throw 'token absent ou refuse';
+  }
+}
+
+// ============================================================
+//  SPREADSHEET — acces aux onglets
+// ============================================================
+
+function feuille(nom) {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sh = ss.getSheetByName(nom);
+  if (!sh) throw 'onglet manquant : ' + nom;
+  return sh;
+}
+
+/** Lit un onglet cle/valeur (ex. affectation) en objet JS. */
+function lireCleValeur(nom) {
+  const donnees = feuille(nom).getDataRange().getValues();
+  const objet = {};
+  for (const ligne of donnees) {
+    if (ligne[0] !== '') objet[ligne[0]] = ligne[1];
+  }
+  return objet;
+}
+
+/**
+ * Lit les points fixes en paires de metres UTM. Format de l'onglet :
+ * `code | easting | northing` (contrairement aux onglets cle/valeur).
+ */
+function positionsLire() {
+  return lireTable(CONFIG.ONGLETS.POSITIONS).reduce((resultat, ligne) => {
+    const code = String(ligne.code || '').trim();
+    const easting = Number(ligne.easting);
+    const northing = Number(ligne.northing);
+    if (!code || !isFinite(easting) || !isFinite(northing)) return resultat;
+    resultat[code] = [easting, northing];
+    return resultat;
+  }, {});
+}
+
+/** Onglet en tableau d'objets (entete = 1re ligne, cles des colonnes). */
+function lireTable(nom) {
+  const valeurs = feuille(nom).getDataRange().getValues();
+  if (valeurs.length < 2) return [];
+  const entete = valeurs[0];
+  return valeurs.slice(1).map((ligne) => {
+    const o = {};
+    entete.forEach((cle, i) => { o[cle] = ligne[i]; });
+    return o;
+  });
+}
+
+// ============================================================
+//  POST /evenements — file d'entree (CDC §3)
+// ============================================================
+
+/** Types d'evenements acceptes (CDC §3.2). */
+const TYPES_ACCEPTES = [
+  'GPS_UPDATE', 'LINE_ADD', 'BLAST_LOCK',
+  'BLAST_UNLOCK', 'BLAST_SEND', 'BLE_RELAY',
+];
+
+/**
+ * Valide l'enveloppe, verifie l'unicite d'event_id (idempotence REQ-015)
+ * et l'ecrit dans l'onglet evenements. Un doublon renvoie status DOUBLON,
+ * que le client traite comme un succes (equivalent 409 du CDC).
+ */
+function evenementTraiter(brut) {
+  let enveloppe;
+  try {
+    enveloppe = JSON.parse(brut);
+  } catch (_) {
+    return corps(false, 'corps illisible (JSON attendu)');
+  }
+  if (!enveloppe || typeof enveloppe !== 'object') {
+    return corps(false, 'enveloppe absente');
+  }
+  if (enveloppe.vers_protocole && enveloppe.vers_protocole !== CONFIG.VERSION_PROTOCOLE) {
+    // Regle CDC §2 adaptee : le protocole est verifie dans le corps.
+    return corps(false, 'protocole refuse : ' + enveloppe.vers_protocole);
+  }
+
+  const id = String(enveloppe.event_id || '');
+  const type = String(enveloppe.event_type || '');
+  if (!id || !/^[0-9a-f-]{36}$/i.test(id)) {
+    return corps(false, 'event_id absent ou mal forme (UUID attendu)');
+  }
+  if (TYPES_ACCEPTES.indexOf(type) < 0) {
+    return corps(false, 'event_type inconnu : ' + type);
+  }
+  if (!enveloppe.payload || typeof enveloppe.payload !== 'object') {
+    return corps(false, 'payload manquant pour ' + type);
+  }
+  if (type === 'GPS_UPDATE' && !payloadGpsValide(enveloppe.payload)) {
+    return corps(false, 'GPS_UPDATE sans easting/northing valides');
+  }
+
+  const sh = feuille(CONFIG.ONGLETS.EVENEMENTS);
+  const verrou = LockService.getScriptLock();
+  // Un client repondant en < 1 s : 30 s de lock suffisent et protegent
+  // deux tablettes qui poussent au meme instant.
+  verrou.waitLock(30000);
+  try {
+    const dernieres = sh.getLastRow();
+    // Idempotence (REQ-015) : balayage des event_ids existants. La colonne A
+    // est l'event_id ; on plafonne le balayage aux dernieres lignes pour que
+    // le cout reste constant au fil des mois.
+    const profondeur = Math.min(dernieres, 2000);
+    if (profondeur > 0) {
+      const ids = sh.getRange(dernieres - profondeur + 1, 1, profondeur, 1).getValues();
+      for (const ligne of ids) {
+        if (String(ligne[0]) === id) {
+          return corps(true, {
+            ack: { event_id: id, status: 'DOUBLON', received_at: maintenant() },
+          });
+        }
+      }
+    }
+
+    // Ecriture : une ligne par evenement, payload en texte brut.
+    sh.appendRow([
+      id,
+      String(enveloppe.gateway_id || ''),
+      String(enveloppe.source_device || ''),
+      type,
+      String(enveloppe.timestamp || ''),
+      maintenant(),                              // received_at (CDC §3.4)
+      JSON.stringify(enveloppe.payload),
+      type === 'GPS_UPDATE' ? Number(enveloppe.payload.easting) || '' : '',
+      type === 'GPS_UPDATE' ? Number(enveloppe.payload.northing) || '' : '',
+    ]);
+    journal('EVENT ' + type + ' ' + id + ' de ' + (enveloppe.source_device || '?'));
+    return corps(true, {
+      ack: { event_id: id, status: 'SYNCED', received_at: maintenant() },
+    });
+  } finally {
+    verrou.releaseLock();
+  }
+}
+
+/** GPS_UPDATE exige easting et northing numeriques (CDC §3.2). */
+function payloadGpsValide(p) {
+  const e = Number(p.easting), n = Number(p.northing);
+  return isFinite(e) && isFinite(n) && e !== 0 && n !== 0;
+}
+
+// ============================================================
+//  GET /affectation — mission en cours (CDC §4)
+// ============================================================
+
+/**
+ * Repond 200 (ok:true) avec l'affectation, ou affectation vide si aucune
+ * mission (equivalent 404 du CDC : le client n'ecrit rien).
+ * Le parcours est renvoye A CHAQUE APPEL (regle §4.4) : il vient du cache
+ * s'il est frais, sinon il est recalcule depuis la position connue du DT.
+ */
+function affectationLire() {
+  const brut = lireCleValeur(CONFIG.ONGLETS.AFFECTATION);
+  if (Object.keys(brut).length === 0) {
+    return corps(true, { affectation: {}, valide_le: '' });
+  }
+
+  const mission = {
+    destination: brut.destination ? String(brut.destination) : '',
+    dumping_area: brut.dumping_area ? String(brut.dumping_area) : '',
+    mission: brut.mission ? String(brut.mission) : '',
+    alerte: brut.alerte ? String(brut.alerte) : '',
+  };
+
+  // Recalcul du parcours : destination changee OU cache expire.
+  const cache = cacheParcours();
+  const cible = mission.destination + '|' + mission.dumping_area;
+  if (!cache || cache.cle !== cible || expireParcours(cache.horodatage)) {
+    const points = calculerParcours(mission.dumping_area);
+    if (points && points.length >= 2) {
+      mission.parcours = JSON.stringify(points);
+      poserCacheParcours(cible, mission.parcours);
+      // Persiste : une coupure Apps Script ne doit pas perdre le trajet.
+      ecrireValeurAffectation('parcours', mission.parcours);
+    } else if (brut.parcours) {
+      // Recalcul impossible (pistes absentes, point inconnu) : le dernier
+      // trajet valide reste servi, une erreur ne doit jamais vider la mission.
+      mission.parcours = String(brut.parcours);
+    }
+  } else {
+    mission.parcours = cache.parcours;
+  }
+
+  return corps(true, { affectation: mission, valide_le: String(brut.valide_le || '') });
+}
+
+/** Ecrit une cle d'affectation sans ecraser les autres (parcours persiste). */
+function ecrireValeurAffectation(cle, valeur) {
+  const sh = feuille(CONFIG.ONGLETS.AFFECTATION);
+  const valeurs = sh.getDataRange().getValues();
+  for (let i = 0; i < valeurs.length; i++) {
+    if (valeurs[i][0] === cle) {
+      sh.getRange(i + 1, 2).setValue(valeur);
+      return;
+    }
+  }
+  sh.appendRow([cle, valeur]);
+}
+
+// ============================================================
+//  PARCOURS — plus court chemin vers la dumping area (CDC §4.5)
+// ============================================================
+
+function cacheParcours() {
+  const brut = PropertiesService.getScriptProperties()
+    .getProperty('cache_parcours');
+  return brut ? JSON.parse(brut) : null;
+}
+
+function poserCacheParcours(cle, parcours) {
+  PropertiesService.getScriptProperties().setProperty('cache_parcours', JSON.stringify({
+    cle: cle,
+    parcours: parcours,
+    horodatage: Date.now(),
+  }));
+}
+
+function expireParcours(horodatage) {
+  return Date.now() - horodatage > CONFIG.CACHE_PARCOURS_S * 1000;
+}
+
+/**
+ * Dijkstra sur le graphe des pistes (LineStrings nommees du GeoJSON), du
+ * depot vers la dumping area demandee. Resultat en UTM metres, >= 2 points.
+ * Rend null si la geometrie n'est pas disponible : l'affectation garde
+ * alors son dernier parcours valide.
+ */
+function calculerParcours(dumpingArea) {
+  try {
+    const geo = DriveApp.getFileById(CONFIG.FICHIER_PISTES_ID).getAs('text/plain')
+      .getDataAsString();
+    const donnees = JSON.parse(geo);
+    const graphe = construireGraphe(donnees);
+    const positions = positionsLire();
+
+    const depart = positions['DEPOT'];
+    const arrivee = positions[dumpingArea];
+    if (!depart || !arrivee) return null;
+
+    const route = dijkstra(graphe, clePoint(depart), clePoint(arrivee));
+    if (!route || route.length < 2) return null;
+    return route;
+  } catch (erreur) {
+    journal('PARCOURS ECHEC ' + erreur);
+    return null;
+  }
+}
+
+/** Cle numerique d'un point (e,n) : arrondi au metre pour fusionner les sommets. */
+function clePoint(p) {
+  return Math.round(p[0]) + ',' + Math.round(p[1]);
+}
+
+/** Construit un graphe {cle: [{voisin, distance}]} depuis les LineStrings. */
+function construireGraphe(geojson) {
+  const graphe = {};
+  function lier(a, b) {
+    const ka = clePoint(a), kb = clePoint(b);
+    const d = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    (graphe[ka] = graphe[ka] || []).push({ v: kb, d: d });
+    (graphe[kb] = graphe[kb] || []).push({ v: ka, d: d });
+  }
+  for (const f of geojson.features || []) {
+    if (!f.geometry || f.geometry.type !== 'LineString') continue;
+    const pts = f.geometry.coordinates;
+    for (let i = 0; i + 1 < pts.length; i++) lier(pts[i], pts[i + 1]);
+  }
+  return graphe;
+}
+
+/** Dijkstra simple (file triee par tableau : quelques centaines de sommets). */
+function dijkstra(graphe, depart, arrivee) {
+  const dist = {}, prec = {}, vus = {};
+  dist[depart] = 0;
+  while (true) {
+    let meilleur = null, dMin = Infinity;
+    for (const k in dist) {
+      if (!vus[k] && dist[k] < dMin) { meilleur = k; dMin = dist[k]; }
+    }
+    if (meilleur === null) break;
+    if (meilleur === arrivee) break;
+    vus[meilleur] = true;
+    for (const arc of graphe[meilleur] || []) {
+      const total = dMin + arc.d;
+      if (dist[arc.v] === undefined || total < dist[arc.v]) {
+        dist[arc.v] = total;
+        prec[arc.v] = meilleur;
+      }
+    }
+  }
+  if (dist[arrivee] === undefined) return null;
+  const chemin = [];
+  for (let k = arrivee; k; k = prec[k]) {
+    const [e, n] = k.split(',').map(Number);
+    chemin.unshift([e, n]);
+    if (k === depart) break;
+  }
+  return chemin;
+}
+
+// ============================================================
+//  GET /blasts — liste des blasts du site (contrat client §2)
+// ============================================================
+
+/**
+ * Format exact attendu par le client (BlastServeur.depuisJson) :
+ *   { "ok": true, "blasts": [ { numero, carte, libelle_carte, blocs: [...], plan_url } ] }
+ * plan_url pointe SUR CE SERVEUR (?action=plan&carte=A1&token=...) : le
+ * telechargement reste sur le meme hote, le jeton ne quitte pas le domaine.
+ */
+function referentielsLire() {
+  const profils = lireTable(CONFIG.ONGLETS.PROFILS)
+      .map((p) => ({
+        code: String(p.code || '').trim(),
+        libelle: String(p.libelle || '').trim(),
+        titre: String(p.titre || '').trim(),
+        role_cdc: String(p.role_cdc || '').trim(),
+        icone: String(p.icone || '').trim(),
+        ordre: Number(p.ordre) || 0,
+        actif: p.actif === true || String(p.actif).toLowerCase() === 'true' || Number(p.actif) === 1 ? 1 : 0,
+      }))
+      .filter((p) => p.code && p.libelle && p.role_cdc);
+  const equipements = lireTable(CONFIG.ONGLETS.EQUIPEMENTS)
+      .map((e) => ({
+        profil: String(e.profil || '').trim(),
+        id: String(e.id || '').trim(),
+        nom: String(e.nom || '').trim(),
+        actif: e.actif === true || String(e.actif).toLowerCase() === 'true' || Number(e.actif) === 1 ? 1 : 0,
+      }))
+      .filter((e) => e.profil && e.id);
+  const dts = lireTable(CONFIG.ONGLETS.DTS)
+      .map((d) => ({
+        type: String(d.type || '').trim(),
+        id: String(d.id || '').trim(),
+        actif: d.actif === true || String(d.actif).toLowerCase() === 'true' || Number(d.actif) === 1 ? 1 : 0,
+      }))
+      .filter((d) => d.type && d.id);
+
+  // Un snapshot vide ou mal formé ne doit jamais être interprété comme une
+  // commande d'effacement par les tablettes.
+  const codesProfils = profils.map((p) => p.code);
+  const types = [...new Set(dts.map((d) => d.type))];
+  const cleEquipements = equipements.map((e) => e.profil + '::' + e.id);
+  const idsDt = dts.map((d) => d.id);
+  const equipementsActifs = new Set(equipements.filter((e) => e.actif).map((e) => e.profil));
+  const idsDtActifs = new Set(dts.filter((d) => d.actif).map((d) => d.type));
+  if (!profils.length || !equipements.length || !types.length ||
+      new Set(codesProfils).size !== profils.length ||
+      equipements.some((e) => !codesProfils.includes(e.profil)) ||
+      new Set(cleEquipements).size !== equipements.length ||
+      new Set(idsDt).size !== idsDt.length ||
+      types.some((type) => !idsDtActifs.has(type)) ||
+      profils.some((p) => p.actif && !equipementsActifs.has(p.code))) {
+    return corps(false, 'referentiels absents ou incoherents');
+  }
+  return corps(true, {
+    referentiels_version: 1,
+    profils: profils,
+    equipements: equipements,
+    dts: dts,
+  });
+}
+
+/** Compare deux numeros de blast (« 106 », « 232.5 ») numeriquement. */
+function comparerNumeros(a, b) {
+  const na = Number(a), nb = Number(b);
+  if (isFinite(na) && isFinite(nb) && na !== nb) return na - nb;
+  return String(a).localeCompare(String(b));
+}
+
+function blastsLire() {
+  const blasts = lireTable(CONFIG.ONGLETS.BLASTS);
+  const blocs = lireTable(CONFIG.ONGLETS.BLOCS);
+  // `cartes` n'est plus un simple cle/valeur : on indexe par `code` pour
+  // rendre le libelle (et les composants de nomenclature) au client.
+  const cartes = {};
+  for (const c of lireTable(CONFIG.ONGLETS.CARTES)) {
+    const code = String(c.code || '').trim();
+    if (code) cartes[code] = c;
+  }
+
+  // Chaque bloc porte SA carte (son RL). On indexe par PATTERN du blast
+  // (le vrai numero de blast), et non par `blocs.blast` qui peut encore
+  // contenir un flitch issu d'une ancienne amorce.
+  const blocsParBlast = {};
+  const blocsParBlastCarte = {};
+  for (const b of blocs) {
+    const num = String(b.numero || '').trim();
+    const carteBloc = String(b.carte || '').trim();
+    if (num === '' || carteBloc === '') continue;
+    const d = decoderCarte(carteBloc);
+    if (!d || !d.numero) continue;
+    const numBlast = String(d.numero);
+    (blocsParBlast[numBlast] = blocsParBlast[numBlast] || []).push(num);
+    const cle = numBlast + '||' + carteBloc;
+    (blocsParBlastCarte[cle] = blocsParBlastCarte[cle] || []).push(num);
+  }
+
+  // Regroupement par NUMERO DE BLAST, et non par le numero stocke dans
+  // l'onglet `blasts` : le vrai identifiant de blast est le PATTERN de la
+  // carte (decoderCarte(...).numero = pattern), tandis que le flitch est le
+  // RL. Une ancienne amorce a pu ecrire le flitch dans `blasts.numero` ; on
+  // ne s'en sert donc jamais. Deux cartes de meme pattern (ex. 260_..._113_6
+  // et 262.5_..._113_5) deviennent UN SEUL blast 113, avec ses deux RL.
+  const parPattern = {};
+  for (const b of blasts) {
+    const code = String(b.carte || '').trim();
+    if (code === '') continue;
+    const d = decoderCarte(code);
+    if (!d || !d.numero) continue;
+    const numBlast = String(d.numero);
+    if (!parPattern[numBlast]) parPattern[numBlast] = [];
+    if (parPattern[numBlast].indexOf(code) < 0) {
+      parPattern[numBlast].push(code);
+    }
+  }
+  // Cartes presentes dans `cartes` mais absentes de `blasts` : on les
+  // rattache aussi par pattern, sinon un blast sans ligne `blasts`
+  // disparaitrait de la liste.
+  for (const code of Object.keys(cartes)) {
+    const d = decoderCarte(code);
+    if (!d || !d.numero) continue;
+    const numBlast = String(d.numero);
+    if (!parPattern[numBlast]) parPattern[numBlast] = [];
+    if (parPattern[numBlast].indexOf(code) < 0) {
+      parPattern[numBlast].push(code);
+    }
+  }
+
+  return corps(true, {
+    blasts: Object.keys(parPattern).sort(comparerNumeros).map((numBlast) => {
+      const declarees = parPattern[numBlast];
+      // Les cartes reellement connues des blocs font foi ; les cartes de
+      // l'onglet `blasts` servent de repli quand `blocs` est vide.
+      const cartesListe = declarees.slice();
+      const code = cartesListe[0];
+      const carte = cartes[code] || {};
+      // Blocs rattaches a leur RL : { carte, blocs: [...] }. Le client sait
+      // ainsi exactement quels blocs appartiennent a quel RL.
+      const blocsParCarte = cartesListe.map((c) => ({
+        carte: c,
+        flitch: (decoderCarte(c) || {}).flitch || '',
+        blocs: (blocsParBlastCarte[numBlast + '||' + c] || []),
+      }));
+      const totalBlocs = blocsParCarte.reduce(
+        (t, e) => t + e.blocs.length, 0);
+      return {
+        numero: numBlast,
+        // Legacy : on garde `carte` (1ere) pour les clients non migres.
+        carte: code,
+        // Liste des cartes (une par RL).
+        cartes: cartesListe,
+        // Blocs regroupes par carte (RL).
+        blocs_par_carte: blocsParCarte,
+        libelle_carte: String(carte.libelle || ''),
+        // Legacy : liste plate (tous les blocs, tous RL confondus).
+        blocs: blocsParBlast[numBlast] || [],
+        nombre_blocs: totalBlocs,
+        plan_url: baseUrl() + '?action=plan&carte=' + encodeURIComponent(code),
+      };
+    }),
+  });
+}
+
+/** Racine de l'URL de la Web App (auto-detectee au premier appel). */
+function baseUrl() {
+  const props = PropertiesService.getScriptProperties();
+  let url = props.getProperty('base_url');
+  if (!url) {
+    url = ScriptApp.getService().getUrl() || '';
+    if (url) props.setProperty('base_url', url);
+  }
+  return url;
+}
+
+// ============================================================
+//  GET /plan — streaming du JPG de la carte depuis Drive
+// ============================================================
+
+/**
+ * Livre les octets du plan depuis le dossier Drive.
+ *
+ * Voie B — le code de carte EST le nom de fichier sans extension (nomenclature
+ * du site : 232.5_OM_LWP2_235_230_106). Aucun prefixe, aucune extension
+ * imposee : le fichier est retrouve par son nom de base, quelle que soit son
+ * extension (.jpg, .jpeg, .png, .gif...).
+ *
+ * Le MIME est celui REELLEMENT declare par Drive, jamais force en JPEG :
+ * annoncer image/jpeg sur des octets PNG ferait echouer l'affichage cote
+ * tablette. Seul repli si Drive rend un type generique (octet-stream) : on
+ * le deduit de l'extension.
+ *
+ * Reponse binaire : c'est le seul cas ou la reponse n'est pas du JSON — le
+ * client (telechargerPlan) ne lit que les octets.
+ */
+function planServir(carte) {
+  if (!carte) throw 'carte absente';
+  const fichiers = DriveApp.getFolderById(CONFIG.DOSSIER_PLANS_ID).getFiles();
+  let trouve = null;
+  while (fichiers.hasNext()) {
+    const f = fichiers.next();
+    const nom = f.getName();
+    const point = nom.lastIndexOf('.');
+    const base = point > 0 ? nom.substring(0, point) : nom;
+    if (base === carte) { trouve = f; break; }
+  }
+  if (!trouve) throw 'plan introuvable : ' + carte;
+
+  const mime = mimePlan(trouve.getName(), trouve.getMimeType());
+  const sortie = Utilities.newBlob(trouve.getBlob().getBytes(), mime);
+  throw new ReponseBinaire(
+    ContentService.createTextOutput('').addBlob(sortie).setMimeType(mime)
+  );
+}
+
+/**
+ * Type MIME du plan : celui de Drive s'il est exploitable, sinon deduit de
+ * l'extension. Couvre les formats presents dans le dossier Map ORE.
+ */
+function mimePlan(nom, mimeDrive) {
+  const m = String(mimeDrive || '').toLowerCase();
+  if (m.indexOf('image/') === 0) return m;
+  const ext = String(nom || '').toLowerCase().split('.').pop();
+  if (ext === 'png') return 'image/png';
+  if (ext === 'gif') return 'image/gif';
+  if (ext === 'jpeg') return 'image/jpeg';
+  return 'image/jpeg';
+}
+
+// ============================================================
+//  GET /notifications — canal serveur -> spotter (ordre du Boss)
+// ============================================================
+
+/**
+ * Le client interroge avec ?depuis=<id> ; le serveur renvoie tout ce qui est
+ * plus recent. Le Boss ecrit dans l'onglet (via POST notification ou a la
+ * main dans le sheet) : une ligne = une notification.
+ *   id | profil | message | horodatage
+ * id est croissant ( genere par le serveur a l'ecriture ), donc "depuis"
+ * suffit pour la reprise apres coupure.
+ */
+function notificationsLire(depuis) {
+  const seuil = parseInt(depuis || '0', 10) || 0;
+  const lignes = lireTable(CONFIG.ONGLETS.NOTIFICATIONS)
+    .filter((n) => String(n.id || '') !== '' && parseInt(String(n.id), 10) > seuil)
+    .map((n) => ({
+      id: parseInt(String(n.id), 10),
+      profil: String(n.profil || ''),
+      message: String(n.message || ''),
+      horodatage: String(n.horodatage || ''),
+    }))
+    .sort((a, b) => a.id - b.id);
+  return corps(true, { notifications: lignes, derniere_id: lignes.length ? lignes[lignes.length - 1].id : seuil });
+}
+
+/**
+ * POST /notification — le Boss (ou un outil admin) depose un message pour
+ * un profil donne. Le spotter le verra au prochain poll.
+ * corps JSON : { profil, message } (profil vide = pour tous).
+ */
+function notificationEcrire(brut) {
+  let p = {};
+  try { p = JSON.parse(brut || '{}'); } catch (err) { /* corps vide */ }
+  const profil = String(p.profil || '').trim();
+  const message = String(p.message || '').trim();
+  if (!message) throw 'message absent';
+  const sh = feuille(CONFIG.ONGLETS.NOTIFICATIONS);
+  // id = dernier + 1, generateur serveur (jamais le client).
+  const derniere = sh.getLastRow() > 1 ? parseInt(String(sh.getRange(sh.getLastRow(), 1).getValue()), 10) || 0 : 0;
+  const id = derniere + 1;
+  sh.appendRow([id, profil, message, maintenant()]);
+  return corps(true, { id: id, profil: profil, message: message });
+}
+
+// ============================================================
+//  SANTE + JOURNAL
+// ============================================================
+
+/** ?action=sante : diagnostic de deploiement (onglets, Drive, jeton). */
+function sante() {
+  initialiser();
+  const etats = {};
+  for (const nom of Object.values(CONFIG.ONGLETS)) {
+    try { etats[nom] = feuille(nom).getLastRow(); } catch (_) { etats[nom] = 'MANQUANT'; }
+  }
+  let pistes = 'ok';
+  try { DriveApp.getFileById(CONFIG.FICHIER_PISTES_ID).getName(); }
+  catch (_) { pistes = 'INACCESSIBLE'; }
+  let plans = 'ok';
+  try { DriveApp.getFolderById(CONFIG.DOSSIER_PLANS_ID).getName(); }
+  catch (_) { plans = 'INACCESSIBLE'; }
+  return corps(true, {
+    service: 'ORE TRACKING serveur',
+    protocole: CONFIG.VERSION_PROTOCOLE,
+    onglets: etats,
+    pistes: pistes,
+    plans: plans,
+    base_url: baseUrl(),
+  });
+}
+
+/** Trace horodate dans l'onglet journal (audit §3.4). */
+function journal(message) {
+  try {
+    feuille(CONFIG.ONGLETS.JOURNAL).appendRow([maintenant(), message]);
+  } catch (_) { /* jamais bloquant */ }
+}
+
+function maintenant() {
+  return new Date().toISOString();
+}
+
+// ============================================================
+//  AMORCAGE — peuplement initial des onglets depuis le Drive
+// ============================================================
+//
+//  A executer UNE FOIS a la main depuis l'editeur Apps Script, apres avoir
+//  renseigne SPREADSHEET_ID, TOKEN et DOSSIER_PLANS_ID. C'est le pendant
+//  « donnees » de initialiserOnglets() : celle-ci cree les onglets, celle-la
+//  les remplit.
+//
+//  PRINCIPE : le dossier Drive est la source de verite. Chaque fichier du
+//  dossier « Map ORE » porte la nomenclature du site en nom de base :
+//
+//      232.5_OM_LWP2_235_230_106.gif
+//       |    |   |    |   |   `-- pattern
+//       |    |   |    |   `------ profondeur de fin
+//       |    |   |    `---------- profondeur de debut
+//       |    |   `--------------- site
+//       |    `------------------- activite
+//       `------------------------ flitch
+//
+//  La fonction en derive les lignes de `cartes`, puis compose une liste de
+//  blasts coherente avec `blocs`, de facon entierement deterministe : deux
+//  executions produisent exactement le meme contenu, aucune donnee n'est
+//  inventee au hasard.
+//
+//  Les numeros de blast sont attribues a partir de NUMERO_BLAST_DEBUT, dans
+//  l'ordre de tri des codes de cartes. Ajustez cette constante ou la liste
+//  BLASTS_AMORCE si la numerotation reelle du site differe.
+// ============================================================
+
+/** Premier numero de blast attribue par l'amorcage. */
+const NUMERO_BLAST_DEBUT = 119;
+
+/**
+ * Blasts a semer : un blast = un code de carte + ses blocs.
+ * Laisser `null` pour generer automatiquement 1 blast par carte du Drive,
+ * avec un seul bloc. Sinon fournir la liste explicite :
+ *   [{ carte: '232.5_OM_LWP2_235_230_106', numero: 119, blocs: [6, 7] }, ...]
+ */
+const BLASTS_AMORCE = null;
+
+/**
+ * Peuple `cartes`, `blasts` et `blocs` depuis le dossier Drive.
+ * Menu Run ▶ amorcerDepuisDrive. Le resultat est ecrit dans le journal.
+ */
+function amorcerDepuisDrive() {
+  const rapport = amorcer();
+  Logger.log(rapport);
+  return rapport;
+}
+
+/**
+ * Coeur de l'amorcage. Rend un compte rendu texte (testable sans journal).
+ */
+function amorcer() {
+  const lignes = [];
+
+  // --- 1. Inventaire du dossier Drive -----------------------------------
+  const dossier = DriveApp.getFolderById(CONFIG.DOSSIER_PLANS_ID);
+  const codes = [];
+  const vus = {};
+  const fichiers = dossier.getFiles();
+  while (fichiers.hasNext()) {
+    const nom = fichiers.next().getName();
+    const base = baseNom(nom);
+    if (!base || vus[base]) continue;
+    vus[base] = true;
+    codes.push(base);
+  }
+  codes.sort();
+  if (!codes.length) {
+    return 'AUCUN FICHIER dans le dossier "' + dossier.getName() +
+           '" : rien a amorcer.';
+  }
+  lignes.push(codes.length + ' carte(s) detectee(s) dans "' +
+              dossier.getName() + '".');
+
+  // --- 2. Onglet `cartes` ------------------------------------------------
+  // Un fichier dont le nom ne respecte pas la nomenclature est refuse : il
+  // n'entre ni dans `cartes` ni dans les blasts, et il est signale dans le
+  // rapport pour correction (renommage) plutot que decode en silence.
+  const lignesCartes = [];
+  const invalides = [];
+  for (const code of codes) {
+    const d = decoderCarte(code);
+    if (!d) { invalides.push(code); continue; }
+    lignesCartes.push([
+      code, d.libelle, d.flitch, d.activite, d.site,
+      d.profDebut, d.profFin, d.pattern,
+    ]);
+  }
+  if (invalides.length) {
+    lignes.push('REFUSES (nomenclature invalide, a renommer) : ' +
+                invalides.join(', '));
+  }
+  if (!lignesCartes.length) {
+    lignes.push('AUCUNE carte valide : amorcement annule, rien ecrit.');
+    return lignes.join('\n');
+  }
+  ecrireTable(CONFIG.ONGLETS.CARTES, SCHEMAS.cartes, lignesCartes);
+  lignes.push('cartes : ' + lignesCartes.length + ' ligne(s) ecrite(s).');
+
+  // --- 3. Blasts et blocs -------------------------------------------------
+  // La numerotation se base uniquement sur les cartes valides (lignesCartes),
+  // jamais sur les fichiers refuses pour nomenclature invalide. Le numero et
+  // le nombre de blocs sont extraits de la nomenclature du fichier (cf.
+  // decoderCarte) : 119/120/121 n'est plus un compteur global, c'est
+  // l'identifiant reellement attribue par le site (flitch -> numero).
+  const blasts = BLASTS_AMORCE || lignesCartes.map((ligne) => {
+    const d = decoderCarte(ligne[0]) || {};
+    const nb = d.nbBlocs || 1;
+    const nums = [];
+    for (let i = 1; i <= nb; i++) nums.push(i);
+    return {
+      carte: ligne[0],
+      numero: d.numero || '?',
+      blocs: nums,
+    };
+  });
+
+  const lignesBlasts = blasts.map((b) => [b.numero, b.carte]);
+  const lignesBlocs = [];
+  for (const b of blasts) {
+    for (const n of (b.blocs || [])) {
+      // `carte` rattache le bloc a son RL ; un blast peut couvrir plusieurs
+      // cartes, mais `BLASTS_AMORCE` n'en porte qu'une par defaut.
+      lignesBlocs.push([b.numero, n, b.carte]);
+    }
+  }
+  ecrireTableOuLoge(CONFIG.ONGLETS.BLASTS, SCHEMAS.blasts, lignesBlasts, ['numero']);
+  ecrireTableOuLoge(CONFIG.ONGLETS.BLOCS, SCHEMAS.blocs, lignesBlocs, ['numero']);
+  ecrireTableOuLoge(CONFIG.ONGLETS.CARTES, SCHEMAS.cartes, lignesCartes, ['flitch']);
+  lignes.push('blasts : ' + lignesBlasts.length + ' ligne(s).');
+  lignes.push('blocs : ' + lignesBlocs.length + ' ligne(s).');
+
+  // --- 4. Controle de coherence ------------------------------------------
+  const cartesSet = {};
+  for (const c of codes) { if (decoderCarte(c)) cartesSet[c] = true; }
+  const orphelins = blasts.filter((b) => !cartesSet[b.carte]);
+  if (orphelins.length) {
+    lignes.push('ATTENTION : ' + orphelins.length +
+                ' blast(s) reference(nt) une carte absente du Drive : ' +
+                orphelins.map((b) => b.numero + '->' + b.carte).join(', '));
+  }
+  const nonUtilisees = codes.filter(
+    (c) => !blasts.some((b) => b.carte === c) && decoderCarte(c));
+  if (nonUtilisees.length) {
+    lignes.push('INFO : ' + nonUtilisees.length +
+                ' carte(s) du Drive sans blast : ' + nonUtilisees.join(', '));
+  }
+
+  // --- 5. Purge : signaler ce qui est dans le sheet mais absent du Drive ----
+  // `ecrireTable` fait `sh.clear()` puis reecrit, donc a chaque appel
+  // d'amocer les blasts/blocs/cartes obsoletes DISPARAISSENT physiquement.
+  // On liste ici ce qui va etre supprime, pour que l'utilisateur voie
+  // l'operation dans le rapport au lieu d'un blanc.
+  const blastsAvant = lireTable(CONFIG.ONGLETS.BLASTS);
+  const nouveauxNumeros = new Set(blasts.map((b) => String(b.numero)));
+  const supprimes = blastsAvant
+    .filter((b) => !nouveauxNumeros.has(String(b.numero)))
+    .map((b) => b.numero + '->' + b.carte);
+  if (supprimes.length) {
+    lignes.push('PURGE : ' + supprimes.length +
+                ' blast(s) obsolete(s) supprime(s) du sheet (absent du Drive) : ' +
+                supprimes.join(', '));
+  }
+
+  lignes.push('Amorcage termine. Lancez ?action=sante pour verifier.');
+  return lignes.join('\n');
+}
+
+/** Nom de base d'un fichier : « plan_A1.jpg » -> « plan_A1 ». */
+function baseNom(nom) {
+  const s = String(nom || '').trim();
+  const point = s.lastIndexOf('.');
+  return point > 0 ? s.substring(0, point) : s;
+}
+
+/**
+ * Valide et eclate un code de carte selon la nomenclature du site :
+ *   <flitch>_<activite>_<site>_<profDebut>_<profFin>_<pattern>[_<nbBlocs>]
+ * ex. 232.5_OM_LWP2_235_230_106 (ancien format, 6 segments)
+ * ex. 232.5_OM_LWP2_235_230_106_4 (format etendu, 7 segments : 4 blocs/polygones)
+ *
+ * `nbBlocs` est **optionnel** : null sur l'ancien format, entier strictement
+ * positif sur le nouveau. La nomenclature reste ascendante-compatible : un
+ * ancien code a 6 segments est toujours accepte, et le caller peut alors
+ * retomber sur l'onglet `blocs` du serveur comme avant.
+ *
+ * Rend null si le code ne respecte pas la nomenclature (le fichier est alors
+ * signale dans le rapport d'amorcage au lieu d'etre accepte en silence).
+ */
+function decoderCarte(code) {
+  const seg = String(code || '').split('_');
+  if (seg.length !== 6 && seg.length !== 7) return null;
+  const d = {
+    flitch: seg[0], activite: seg[1], site: seg[2],
+    profDebut: seg[3], profFin: seg[4], pattern: seg[5],
+    nbBlocs: null,
+    libelle: '',
+  };
+  if (!d.flitch || !d.activite || !d.site || !d.pattern) return null;
+  if (!/^[0-9.]+$/.test(d.profDebut) || !/^[0-9.]+$/.test(d.profFin)) return null;
+  // `nbBlocs` : 7eme segment, entier strictement positif.
+  if (seg.length === 7) {
+    if (!/^[0-9]+$/.test(seg[6])) return null;
+    const n = parseInt(seg[6], 10);
+    if (!Number.isFinite(n) || n < 1) return null;
+    d.nbBlocs = n;
+  }
+  // `numero` derive de la nomenclature : c'est l'avant-dernier segment
+  // (seg[5], le `pattern`) qui est l'identifiant du blast sur le site.
+  // Ex. `232.5_OM_LWP2_235_230_106` -> numero = "106" (le pattern).
+  // Le `flitch` (seg[0]) sert uniquement a designer le RL/zone ; ce n'est
+  // PAS l'identifiant du blast. On conserve la chaine exacte du pattern
+  // pour eviter toute collision (deux pattern distincts => deux numeros
+  // distincts, sans conversion numerique parasite).
+  d.numero = d.pattern;
+  d.libelle = 'Blast ' + d.numero +
+              ' - Flitch ' + d.flitch +
+              ' - ' + d.site +
+              ' - ' + d.profDebut + '/' + d.profFin +
+              ' - ' + d.pattern +
+              (d.nbBlocs != null ? ' (' + d.nbBlocs + ' bloc(s))' : '');
+  return d;
+}
+
+/**
+ * Reecrit un onglet : entete en ligne 1, puis les lignes fournies. Les
+ * donnees precedentes de cet onglet sont remplacees — les autres onglets
+ * ne sont jamais touches. Utilise par l'amorcage, jamais par le routage.
+ *
+ * `colonnesTexte` : noms de colonnes a forcer en format Texte brut (`@`)
+ * apres l'ecriture. Necessaire pour les colonnes qui portent des chaines
+ * ressemblant a des nombres (ex. `numero` = `"232.5"`, `flitch` = `"235.0"`) :
+ * sans ce format, Google Sheets les convertit silencieusement en nombre
+ * et tronque la decimale a l'affichage, ecrasant des blasts distincts.
+ */
+function ecrireTable(nom, entete, lignes, colonnesTexte) {
+  const sh = feuille(nom);
+  sh.clear();
+  sh.getRange(1, 1, 1, entete.length).setValues([entete]).setFontWeight('bold');
+  sh.setFrozenRows(1);
+  if (lignes.length) {
+    sh.getRange(2, 1, lignes.length, entete.length).setValues(lignes);
+  }
+  // Force le format Texte sur les colonnes qui DOIVENT rester des chaines
+  // (meme si elles ressemblent a des nombres). On le fait apres l'ecriture
+  // pour que la valeur soit deja en place, puis on verrouille son format.
+  if (colonnesTexte && colonnesTexte.length) {
+    for (const nomCol of colonnesTexte) {
+      const idx = entete.indexOf(nomCol);
+      if (idx < 0) continue;
+      const col = idx + 1;
+      const last = Math.max(2, sh.getLastRow());
+      sh.getRange(2, col, last - 1, 1).setNumberFormat('@');
+    }
+  }
+}
+
+/**
+ * Variante d'ecrireTable qui ne propage PAS l'exception : en cas d'echec
+ * (onglet protege, permissions, etc.), on loge dans le journal et on continue,
+ * pour ne JAMAIS casser l'amorcage. Le log permet de diagnostiquer pourquoi
+ * un onglet n'a pas ete reecrit alors que le Drive avait bien les fichiers.
+ */
+function ecrireTableOuLoge(nom, entete, lignes, colonnesTexte) {
+  try {
+    ecrireTable(nom, entete, lignes, colonnesTexte);
+  } catch (erreur) {
+    journal('ECRITURE ECHEC onglet "' + nom + '" : ' + String(erreur));
+    throw erreur;
+  }
+}
+
+// ============================================================
+//  AMORCAGE TEST — profils + equipements + dts + positions de test
+// ============================================================
+//
+//  Menu Run ▶ semerReferentielsTest. Remplit `profils`, `equipements`,
+//  `dts` et `positions` avec un jeu de donnees coherent, conforme aux
+//  regles de referentielsLire() :
+//   - chaque profil actif a au moins un equipement actif ;
+//   - chaque type de `dts` a au moins un DT actif ;
+//   - ids uniques, DEPOT present dans `positions`.
+//
+//  ATTENTION : ces quatre onglets sont reinitialises (sh.clear()). Ne pas
+//  lancer si des donnees reelles y ont ete saisies a la main.
+// ============================================================
+
+function semerReferentielsTest() {
+  Logger.log(semerReferentiels());
+}
+
+/** Coeur testable : rend un compte rendu texte. */
+function semerReferentiels() {
+  const lignes = [];
+
+  const profils = [
+    ['DT',        'Chauffeur DT', 'Conducteur de dameuse',    'DT',          'dt',        1, true],
+    ['EXCAVATOR', 'Excavator',    'Conducteur d excavatrice', 'EXCAVATOR',   'excavator', 2, true],
+    ['SPOT',      'Spotter',                  'Spotter',     'SPOTTER',   'spot',      3, true],
+  ];
+
+  const equipements = [
+    // Spotter : identifiant nominatif (pas de liste deroulante d'equipement,
+    // un seul champ = la personne elle-meme).
+    ['SPOT', 'Koffi Charles',  'Koffi Charles',  true],
+    ['SPOT', 'Edouard Grant',  'Edouard Grant',  true],
+    ['EXCAVATOR', 'EXCA-01', 'Excavatrice 01', true],
+    ['DT',        'DT-01',   'DT 01',          true],
+    ['DT',        'DT-02',   'DT 02',          true],
+  ];
+
+  const dts = [
+    ['DT', 'TAB3-01', true],
+  ];
+
+  const positions = [
+    ['DEPOT', 452300, 6284000],
+    ['DA1',   453100, 6284500],
+    ['DA2',   453600, 6284800],
+  ];
+
+  ecrireTable(CONFIG.ONGLETS.PROFILS, SCHEMAS.profils, profils);
+  lignes.push('profils : ' + profils.length + ' ligne(s).');
+
+  ecrireTable(CONFIG.ONGLETS.EQUIPEMENTS, SCHEMAS.equipements, equipements);
+  lignes.push('equipements : ' + equipements.length + ' ligne(s).');
+
+  ecrireTable(CONFIG.ONGLETS.DTS, SCHEMAS.dts, dts);
+  lignes.push('dts : ' + dts.length + ' ligne(s).');
+
+  ecrireTable(CONFIG.ONGLETS.POSITIONS, SCHEMAS.positions, positions);
+  lignes.push('positions : ' + positions.length +
+              ' ligne(s) (DEPOT, DA1, DA2 — coordonnees UTM a ajuster).');
+
+  lignes.push('Referentiels de test semes. Verifiez via ?action=referentiels.');
+  return lignes.join('\n');
+}

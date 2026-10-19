@@ -1,0 +1,32 @@
+# Flutter / Dart
+.dart_tool/
+.packages
+.pub-cache/
+.pub/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+*.dill
+*.iml
+.idea/
+
+# Android
+android/.gradle/
+android/local.properties
+android/app/build/
+android/captures/
+*.jks
+*.keystore
+
+# Windows
+windows/flutter/ephemeral/
+windows/flutter/CMakeUserPresets.json
+
+# Web
+web/.dart_tool/
+
+# Divers
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
