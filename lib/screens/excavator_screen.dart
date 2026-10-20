@@ -41,12 +41,19 @@ class ExcavatorScreen extends StatelessWidget {
                 Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    // Badges compacts dans la barre du haut : ils partagent
-                    // l'espace avec le nom, plutot que de garder 150 px fixes.
+                    // Badge de gauche : le GPS **de l'excavatrice**. La position
+                    // du DT est celle qui decrit le site, mais c'est de cette
+                    // tablette que part la moyenne de perle : sans GPS ici,
+                    // aucune moyenne n'a de sens.
+                    //
+                    // Plus de badge 4G : l'excavatrice ne porte pas la liaison
+                    // serveur (c'est le DT qui la porte et qui pousse les
+                    // evenements). L'ancien voyant restait rouge en permanence
+                    // sans rien signaler de reel.
                     SizedBox(
                       width: mise.tailleBadge.width,
                       height: mise.tailleBadge.height,
-                      child: GsmStatusBadge(etat: session.etat4G),
+                      child: GpsStatusBadge(etat: session.etatGps),
                     ),
                     Expanded(
                       child: Center(
@@ -86,20 +93,24 @@ class ExcavatorScreen extends StatelessWidget {
                         ),
                       ),
                     ),
-                    // Liens et capteurs a droite du nom : BLE (voyant
-                    // bluetooth, lien vers le DT), Wi-Fi hotspot (voyant
-                    // wifi) et GPS externe USB-C.
+                    // A droite du nom, les deux liens qui font vivre le
+                    // terrain : le point d'acces (le reseau que les autres
+                    // tablettes rejoignent) et le BLE (le lien qui porte la
+                    // proximite de 10 m et la session perle).
                     SizedBox(width: 8 * k),
                     SizedBox(
                       width: mise.tailleBadge.width,
                       height: mise.tailleBadge.height,
-                      child: BleStatusBadge(etat: session.etatBle),
+                      child: PointAccesStatusBadge(
+                        etat: session.etatPointAcces,
+                        ssid: session.ssidExcavatrice,
+                      ),
                     ),
                     SizedBox(width: 8 * k),
                     SizedBox(
                       width: mise.tailleBadge.width,
                       height: mise.tailleBadge.height,
-                      child: GpsStatusBadge(etat: session.etatGps),
+                      child: BleStatusBadge(etat: session.etatBle),
                     ),
                   ],
                 ),

@@ -37,12 +37,14 @@
     <!-- BLE obligatoire pour installer l'app sur les tablettes du parc. -->
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true"/>
 
-    <!-- Point d'acces Wi-Fi automatique cote excavatrice (profil excavator
-         profil, Wi-Fi Direct / WifiP2pManager). Android 13+ reserve
-         startLocalOnlyHotspot() aux apps systeme : Wi-Fi Direct est la seule
-         voie publique pour devenir point d'acces depuis l'application.
-         NEARBY_WIFI_DEVICES est la permission runtime Android 13+ ;
-         CHANGE_WIFI_STATE et ACCESS_FINE_LOCATION couvrent les anciennes. -->
+    <!-- Point d'acces Wi-Fi automatique cote excavatrice (profil excavator).
+         Voie principale : WifiManager.startLocalOnlyHotspot(), API publique
+         du framework depuis Android 8 — elle cree un reseau local SANS
+         Internet, exactement ce dont l'excavatrice a besoin (c'est le DT qui
+         porte la 4G). Elle exige NEARBY_WIFI_DEVICES sur Android 13+, et la
+         localisation fine activee en dessous.
+         Repli : Wi-Fi Direct (WifiP2pManager) si le hotspot est refuse.
+         CHANGE_WIFI_STATE et ACCESS_WIFI_STATE couvrent l'etat de la radio. -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/>
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"

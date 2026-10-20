@@ -180,6 +180,11 @@ class BleGateway {
         _liens[id]?.envoyer(BleProtocole.encoder(
             BleProtocole.ping('EXC-001')));
         break;
+      case BleProtocole.typeProvision:
+        // Le client confirme avoir recu le reseau : on journalise, la
+        // connexion Wi-Fi se fait de son cote.
+        surProvisionRecue?.call(id, message);
+        break;
       default:
         _journal.ligne('BLE $id : type inconnu ${message['type']}');
     }
@@ -200,6 +205,33 @@ class BleGateway {
   /// Appareil sorti de la zone ou deconnecte : la couche au-dessus gelee la
   /// moyenne de la session et la remet a zero (§2.3 : "decollage").
   void Function(String source)? surDeconnexion;
+
+  /// Provisionnement reseau : pousse le SSID et le mot de passe du point
+  /// d'acces a un client deja authentifie.
+  ///
+  /// N'est envoye qu'**apres** le handshake : un appareil non enrole ne peut
+  /// donc jamais recevoir les identifiants du reseau. Rend le nombre de
+  /// clients servis.
+  Future<int> provisionner(Map<String, Object?> provision) async {
+    if (provision.isEmpty) return 0;
+    final Uint8List octets = BleProtocole.encoder(provision);
+    int servis = 0;
+    for (final MapEntry<String, LienBle> e in _liens.entries) {
+      try {
+        await e.value.envoyer(octets);
+        servis++;
+      } catch (_) {
+        // Lien parti entre-temps : le client redemandera au prochain contact.
+      }
+    }
+    if (servis > 0) {
+      _journal.ligne('PROVISION envoyee a $servis client(s)');
+    }
+    return servis;
+  }
+
+  /// Un client confirme avoir recu la provision reseau.
+  void Function(String source, Map<String, Object?> message)? surProvisionRecue;
 
   /// Envoie un ACK a l'appareil source (idempotence CDC §17).
   Future<void> acquitter(String source, String eventId) async {
@@ -315,6 +347,10 @@ class BleClient {
   /// la couche au-dessus le stocke pour l'envoyer ensuite au serveur.
   void Function(Map<String, Object?> evenement)? surEvenement;
 
+  /// Provisionnement reseau recu : `{ssid, mot_de_passe, adresse, port}`.
+  /// La couche au-dessus s'y connecte puis confirme par [confirmerProvision].
+  void Function(Map<String, Object?> provision)? surProvision;
+
   /// Demarre la decouverte et la connexion a l'excavatrice (emetteur).
   ///
   /// Retourne des que connecte et authentifie, ou apres [delai] si
@@ -409,6 +445,16 @@ class BleClient {
     _journal.ligne('BLE $eventId envoye, ACK attendu');
   }
 
+  /// Confirme a l'excavatrice que le reseau a ete rejoint : elle peut cesser
+  /// de renvoyer la provision a ce client.
+  Future<void> confirmerProvision() async {
+    final LienBle? lien = _lien;
+    if (lien == null || !connecte) return;
+    await lien.envoyer(BleProtocole.encoder(
+      <String, Object?>{'type': BleProtocole.typeProvision, 'ok': true},
+    ));
+  }
+
   void _traiterMessage(Uint8List octets) {
     final Map<String, Object?>? m = BleProtocole.decoder(octets);
     if (m == null) return;
@@ -417,6 +463,12 @@ class BleClient {
       fileAttente.removeWhere((e) => e['event_id'] == id);
       surAck?.call(id);
       _journal.ligne('BLE ACK recu pour $id');
+    } else if (m['type'] == BleProtocole.typeProvision) {
+      // L'excavatrice nous donne le reseau a rejoindre : la couche au-dessus
+      // ouvre la connexion Wi-Fi, puis en accuse reception.
+      surProvision?.call(m);
+      _journal.ligne(
+          'BLE provision recue : SSID ${m['ssid']}');
     } else if (m['type'] == BleProtocole.typeEvenement) {
       // Relais recu (excavatrice -> DT) : la couche au-dessus le stocke puis
       // l'acquitte, ce qui purge la file du relais.

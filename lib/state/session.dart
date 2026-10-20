@@ -1242,6 +1242,9 @@ feederPerle(mesure);
     _timerWifi = null;
     bleActif = false;
     wifiActif = false;
+    pointAccesActif = false;
+    ssidExcavatrice = '';
+    motDePasseExcavatrice = '';
     // Aucune file n'est plus en vol : les fleches d'echange retombent.
     envoiBleActif = false;
     envoiWifiActif = false;
@@ -1408,9 +1411,18 @@ feederPerle(mesure);
       gateway.surNotification = (Map<String, Object?> notif) {
         unawaited(recevoirNotificationLocale(notif));
       };
-      // Entree dans le rayon : le DT est "pret et charge", on ouvre sa session
-      // perle. Sortie de rayon : il "decolle", on gelee la moyenne (§2.3).
-      gateway.surConnexion = ouvrirSessionPerle;
+      // Provisionnement : des qu'un DT s'authentifie, il recoit le reseau
+      // a rejoindre. C'est ce qui evite toute saisie manuelle cote client.
+      gateway.surConnexion = (String source) {
+        ouvrirSessionPerle(source);
+        unawaited(_provisionnerClient(gateway, source));
+      };
+      gateway.surProvisionRecue = (String source, Map<String, Object?> m) {
+        if (m['ok'] == true) {
+          push('Provision confirmee par $source - reseau rejoint');
+          notifyListeners();
+        }
+      };
       gateway.surDeconnexion = (String _) => fermerSessionPerle();
       _gatewayBle = gateway;
       await gateway.demarrer();
@@ -1471,6 +1483,33 @@ feederPerle(mesure);
   WifiClient? get clientWifi => _clientWifi;
   WifiClient? _clientWifi;
 
+  /// SSID et mot de passe du point d'acces ouvert par l'excavatrice.
+  ///
+  /// Android les choisit (SSID suffixe pour eviter les collisions), donc ce
+  /// sont les seules valeurs valables : les clients doivent s'y connecter
+  /// tels quels. Vides pour les autres profils, et tant qu'aucun point
+  /// d'acces n'est ouvert.
+  String ssidExcavatrice = '';
+  String motDePasseExcavatrice = '';
+
+  /// Vrai quand l'excavatrice heberge reellement un point d'acces.
+  ///
+  /// Ce n'est pas la meme chose que [wifiActif] (la couche TCP tourne) ni que
+  /// [etatWifiP2p] (un client est branche) : cet indicateur dit si le
+  /// **reseau** existe. Sans lui, un spotter peut tourner en rond sans savoir
+  /// qu'aucun point d'acces n'est disponible.
+  bool pointAccesActif = false;
+
+  /// Etat du point d'acces, pour le voyant de l'ecran excavator.
+  ///
+  /// Rouge : couche non demarree, ou demarrage refuse par l'appareil.
+  /// Orange : demarrage en cours. Vert : reseau ouvert, SSID disponible.
+  EtatCouche get etatPointAcces {
+    if (!wifiActif) return EtatCouche.arret;
+    if (pointAccesActif) return EtatCouche.connecte;
+    return EtatCouche.recherche;
+  }
+
   /// État Wi-Fi exposé aux écrans (même pattern que [bleActif]).
   bool wifiActif = false;
   int clientsWifiConnectes = 0;
@@ -1500,13 +1539,31 @@ feederPerle(mesure);
     final bool estTab1 = BaseLocale.estTab1(profil.roleCdc);
     final bool estDt = BaseLocale.estTab2(profil.roleCdc);
     if (estExcavatrice) {
-      // 1. Le reseau d'abord : Wi-Fi Direct cree le groupe, l'excavatrice en
-      //    Group Owner. C'est ce qui remplace le hotspot manuel. Sans cette
-      //    etape, le serveur TCP ecouterait sur une interface inexistante.
-      final bool groupe = await WifiDirect.demarrer(nom: idGateway);
-      push(groupe
-          ? 'Wi-Fi Direct : groupe $idGateway cree (point d\'acces actif)'
-          : 'Wi-Fi Direct indisponible - point d\'acces a activer manuellement');
+      // 1. Le reseau d'abord. Voie normale : LocalOnlyHotspot, cree par le
+      //    framework Android — plus stable que Wi-Fi Direct, qui echoue sur
+      //    plusieurs tablettes Android 15 (`createGroup` code 2). Wi-Fi Direct
+      //    reste le repli si le hotspot est refuse par l'appareil.
+      //    Sans cette etape, le serveur TCP ecouterait sur une interface
+      //    inexistante.
+      final DemarrageReseau? reseau = await WifiDirect.demarrerDetaille(
+        nom: idGateway,
+      );
+      ssidExcavatrice = reseau?.ssid ?? '';
+      motDePasseExcavatrice = reseau?.motDePasse ?? '';
+      pointAccesActif = reseau?.ok == true;
+      if (reseau?.ok == true) {
+        push(
+          reseau!.type == 'hotspot'
+              ? 'Point d\'acces actif - SSID ${reseau.ssid ?? idGateway} '
+                  '(mot de passe ${reseau.motDePasse ?? '-'})'
+              : 'Wi-Fi Direct : groupe $idGateway cree (point d\'acces actif)',
+        );
+      } else {
+        push(
+          'Point d\'acces indisponible : ${reseau?.erreur ?? 'aucune reponse'} '
+          '- donnees en file locale',
+        );
+      }
       // 2. Puis le serveur applicatif, sur l'interface du groupe.
       final TransportTcpWifi tcp = transport is TransportTcpWifi
           ? transport
@@ -1522,18 +1579,9 @@ feederPerle(mesure);
       // D'abord le reseau : on decouvre le groupe Wi-Fi Direct de l'excavatrice
       // et on s'y connecte. Sans cela, il n'existe aucune interface pour
       // joindre son serveur TCP (plus de hotspot manuel a configurer).
-      final List<Map<String, String>> groupes = await WifiDirect.decouvrir();
-      final bool vu = groupes.any(
-        (Map<String, String> p) => (p['nom'] ?? '').startsWith('ORE-EXC'),
-      );
-      if (vu) {
-        final bool joint = await WifiDirect.connecter(nom: 'ORE-EXC');
-        push(joint
-            ? 'Wi-Fi Direct : connecte au groupe de l\'excavatrice'
-            : 'Wi-Fi Direct : connexion au groupe refusee');
-      } else {
-        push('Wi-Fi Direct : excavatrice hors portee - donnees en file locale');
-      }
+      // Le reseau n'est plus cherche par Wi-Fi Direct (qui echoue sur
+      // Android 15) : c'est le BLE qui annonce SSID + mot de passe, apres
+      // authentification. Sans provision recue, la file reste locale.
       final WifiClient client = WifiClient(
         transport: transport,
         // Meme regle que le BLE : le `source_device` doit etre l'identifiant
@@ -1560,6 +1608,7 @@ feederPerle(mesure);
           await client.envoyer(_enveloppeAck(id, client.sourceDevice));
         });
       };
+
       // Reconnexion automatique (REQ-008) : à chaque retour de lien, la file
       // repart automatiquement (l'envoi initial est dans _retransmettreFileWifi).
       client.surReconnexion = _retransmettreFileWifi;
@@ -1631,6 +1680,56 @@ feederPerle(mesure);
     );
     notifyListeners();
     unawaited(acquitter('${normalise['event_id']}'));
+  }
+
+  /// Envoie la provision reseau (SSID + mot de passe) a un client BLE.
+  ///
+  /// Le message ne part qu'apres le handshake : un appareil non enrole ne
+  /// peut donc jamais recevoir les identifiants du point d'acces.
+  Future<void> _provisionnerClient(BleGateway gateway, String source) async {
+    if (ssidExcavatrice.isEmpty) return;
+    final int servis = await gateway.provisionner(
+      BleProtocole.provision(
+        ssid: ssidExcavatrice,
+        motDePasse: motDePasseExcavatrice,
+        adresse: adressePointAcces,
+        port: portWifi,
+      ),
+    );
+    if (servis > 0) push('Provision reseau envoyee a $servis client(s)');
+  }
+
+  /// Adresse IPv4 du point d'acces (celle que les clients joignent en TCP).
+  String adressePointAcces = '';
+
+  /// Rejoint le reseau annonce par l'excavatrice (provision recue par BLE).
+  ///
+  /// Le transport Wi-Fi du client est deja en place : on lui donne seulement
+  /// l'adresse a joindre, puisqu'Android a choisi un SSID aleatoire que l'on
+  /// ne peut pas reconnaitre a son nom.
+  Future<void> _rejoindreReseauAnnonce(
+    BleClient? client,
+    Map<String, Object?> m,
+  ) async {
+    final String adresse = '${m['adresse'] ?? ''}';
+    ssidExcavatrice = '${m['ssid'] ?? ''}';
+    adressePointAcces = adresse;
+    final WifiClient? wifi = _clientWifi;
+    if (wifi == null) {
+      push('Provision recue : SSID $ssidExcavatrice - Wi-Fi pas encore demarre');
+      notifyListeners();
+      return;
+    }
+    final bool ok = await wifi.connecter(adresseImposee: adresse);
+    if (ok) {
+      await _retransmettreFileWifi();
+      // Confirme a l'excavatrice : elle peut cesser de renvoyer la provision.
+      unawaited(client?.confirmerProvision() ?? Future<void>.value());
+      push('Reseau de l\'excavatrice rejoint ($ssidExcavatrice)');
+    } else {
+      push('Provision recue mais reseau injoignable ($adresse)');
+    }
+    notifyListeners();
   }
 
   /// Enveloppe d'acquittement pour un evenement recu par relais.

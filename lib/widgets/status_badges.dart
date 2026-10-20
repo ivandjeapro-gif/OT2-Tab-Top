@@ -583,3 +583,69 @@ class _SyncCloudIconState extends State<SyncCloudIcon>
     );
   }
 }
+
+/// Boite d'etat du **point d'acces** porte par l'excavatrice.
+///
+/// Distincte de [WifiP2pStatusBadge] (qui compte les clients branches a la
+/// couche TCP) : ici on montre le **reseau lui-meme**. C'est le voyant qui dit
+/// a l'operateur « les autres tablettes peuvent me joindre », et sans lui un
+/// spotter cherche une excavatrice qui n'emet rien.
+///
+/// Rouge = couche arretee ou demarrage refuse, orange = demarrage en cours,
+/// vert = reseau ouvert. Le SSID reel est affiche des que le point d'acces
+/// existe : c'est celui qu'Android a attribue, pas celui demande.
+class PointAccesStatusBadge extends StatelessWidget {
+  const PointAccesStatusBadge({
+    super.key,
+    required this.etat,
+    this.ssid = '',
+    this.remplir = false,
+  });
+
+  final EtatCouche etat;
+
+  /// SSID reellement attribue par Android (vide tant que rien n'est ouvert).
+  final String ssid;
+
+  final bool remplir;
+
+  String get _libelle {
+    if (etat != EtatCouche.connecte) return etat.libelle;
+    // SSID trop long pour le cadre : on garde la fin, qui porte le suffixe
+    // discriminant (`AndroidShare_6247` -> `…_6247`).
+    if (ssid.isEmpty) return 'AP';
+    return ssid.length <= 10 ? ssid : '…${ssid.substring(ssid.length - 8)}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final MiseEnPage mise = MiseEnPage.depuis(context);
+    final double k = mise.k;
+    final Color color = etat.couleur;
+    return _BoiteBadge(
+      taille: mise.tailleBadge,
+      couleur: color,
+      epaisseur: (2 * k).clamp(1.0, 2.0),
+      remplir: remplir,
+      enfant: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.wifi_tethering, size: (46 * k).clamp(20.0, 46.0), color: color),
+          SizedBox(height: (4 * k).clamp(2.0, 4.0)),
+          Text(
+            _libelle,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontFamily: kSerif,
+              fontSize: (13 * k).clamp(9.0, 13.0),
+              color: color,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}

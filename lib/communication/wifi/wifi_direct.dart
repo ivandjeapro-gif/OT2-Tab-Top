@@ -25,6 +25,17 @@ class WifiDirect {
 
   static const MethodChannel _canal = MethodChannel('ore_tracking/wifi_direct');
 
+  /// Mot de passe fixe du point d'acces cote excavatrice.
+  ///
+  /// Doit rester **le meme a chaque demarrage** : c'est ce qui permet a un DT
+  /// deja enrole de se reconnecter sans jamais ressaisir d'identifiants. La
+  /// valeur est dupliquee dans `HotspotManager.MOT_DE_PASSE_DEFAUT` (cote
+  /// Kotlin, Android 13+ ne peut fixer que ce qui lui est transmis).
+  static const String _motDePasseDefaut = 'oretracking';
+
+  /// Mot de passe annonce aux clients (visible sur l'ecran excavator).
+  static String get motDePassePointAcces => _motDePasseDefaut;
+
   /// Vrai sur Android : seule plateforme ou le canal natif existe.
   static bool get _estAndroid => !kIsWeb && Platform.isAndroid;
 
@@ -35,19 +46,42 @@ class WifiDirect {
   /// echec (permission refusee, materiel absent) rend `false`, l'appelant
   /// journalise et continue.
   static Future<bool> demarrer({String nom = 'ORE-EXC-001'}) async {
-    if (!_estAndroid) return false;
+    final DemarrageReseau? r = await demarrerDetaille(nom: nom);
+    return r?.ok ?? false;
+  }
+
+  /// Demarre le point d'acces et rend le reseau **reellement** cree.
+  ///
+  /// Android ne conserve pas le nom demande : il suffixe le SSID pour eviter
+  /// les collisions (`ORE-EXC-001-a1b2`) et choisit lui-meme le mot de passe.
+  /// Ce sont ces valeurs-la que les clients doivent employer — un client qui
+  /// cherche `ORE-EXC-001` au caractere pres ne trouverait rien.
+  ///
+  /// Rend `null` hors Android ou si le canal natif estabsent.
+  static Future<DemarrageReseau?> demarrerDetaille({
+    String nom = 'ORE-EXC-001',
+    String motDePasse = _motDePasseDefaut,
+  }) async {
+    if (!_estAndroid) return null;
     try {
       final Map<Object?, Object?>? reponse =
           await _canal.invokeMethod<Map<Object?, Object?>>(
         'demarrer',
-        <String, Object?>{'nom': nom},
+        <String, Object?>{'nom': nom, 'motDePasse': motDePasse},
       );
-      return reponse?['ok'] == true;
-    } on PlatformException {
-      return false;
+      if (reponse == null) return null;
+      return DemarrageReseau(
+        ok: reponse['ok'] == true,
+        erreur: reponse['erreur']?.toString(),
+        ssid: reponse['ssid']?.toString(),
+        motDePasse: reponse['motDePasse']?.toString(),
+        type: reponse['type']?.toString() ?? 'inconnu',
+      );
+    } on PlatformException catch (e) {
+      return DemarrageReseau(ok: false, erreur: e.message, type: 'erreur');
     } on MissingPluginException {
       // Canal absent (plugin non compile) : on ne bloque pas l'app.
-      return false;
+      return null;
     }
   }
 
@@ -151,4 +185,31 @@ class WifiDirect {
       return const <String>[];
     }
   }
+}
+
+/// Resultat d'un demarrage de reseau local (hotspot ou Wi-Fi Direct).
+///
+/// [type] dit **quelle voie** a repondu : `hotspot` (voie normale), `wifi_direct`
+/// (repli) ou `erreur`. [ssid] et [motDePasse] ne sont renseignes que par le
+/// hotspot : c'est Android qui les choisit, l'application doit les employer
+/// tels quels pour que les clients s'y connectent.
+class DemarrageReseau {
+  const DemarrageReseau({
+    required this.ok,
+    this.erreur,
+    this.ssid,
+    this.motDePasse,
+    this.type = 'inconnu',
+  });
+
+  final bool ok;
+  final String? erreur;
+  final String? ssid;
+  final String? motDePasse;
+  final String type;
+
+  @override
+  String toString() => ok
+      ? 'DemarrageReseau($type, ssid: ${ssid ?? '-'})'
+      : 'DemarrageReseau(ECHEC $type : ${erreur ?? 'motif inconnu'})';
 }

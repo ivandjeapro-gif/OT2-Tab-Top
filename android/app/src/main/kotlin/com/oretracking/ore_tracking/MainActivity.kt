@@ -33,11 +33,13 @@ class MainActivity : FlutterActivity() {
     private val codePermissionWifi = 4210
 
     private var wifiDirect: WifiDirectManager? = null
+    private var hotspot: HotspotManager? = null
     private var pendingResult: MethodChannel.Result? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         wifiDirect = WifiDirectManager(applicationContext)
+        hotspot = HotspotManager(applicationContext)
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, canal)
             .setMethodCallHandler { appel, resultat ->
@@ -47,24 +49,66 @@ class MainActivity : FlutterActivity() {
                     return@setMethodCallHandler
                 }
                 when (appel.method) {
-                    "demarrer" -> {
+                    // Point d'acces local : voie par defaut de l'excavatrice.
+                    // `LocalOnlyHotspot` est une API du framework (Android 8+) :
+                    // le systeme choisit le reseau et rend SSID + mot de passe,
+                    // sans les contraintes ni les echecs de Wi-Fi Direct.
+                    "demarrer", "demarrer_hotspot" -> {
                         val nom = appel.argument<String>("nom") ?: "ORE-EXC-001"
+                        val mdp = appel.argument<String>("motDePasse")
+                        val h = hotspot
+                        if (appel.method == "demarrer_hotspot" || (h != null && h.estDisponible())) {
+                            if (h == null) {
+                                resultat.success(mapOf("ok" to false, "erreur" to "hotspot indisponible"))
+                                return@setMethodCallHandler
+                            }
+                            if (!aPermissionWifi()) {
+                                pendingResult = resultat
+                                demanderPermissionWifi()
+                                return@setMethodCallHandler
+                            }
+                            h.demarrer(
+                                nom,
+                                mdp ?: HotspotManager.MOT_DE_PASSE_DEFAUT,
+                            ) { ok, erreur, ssid, mdpReseau ->
+                                runOnUiThread {
+                                    resultat.success(
+                                        mapOf(
+                                            "ok" to ok,
+                                            "erreur" to erreur,
+                                            "ssid" to ssid,
+                                            // Le mot de passe REEL du reseau, pas celui
+                                            // demande : en repli, Android en genere un autre.
+                                            "motDePasse" to (mdpReseau ?: mdp),
+                                            "type" to "hotspot",
+                                        )
+                                    )
+                                }
+                            }
+                            return@setMethodCallHandler
+                        }
+                        // Repli : Wi-Fi Direct (Android ancien ou hotspot refuse).
                         if (!aPermissionWifi()) {
-                            // On demande la permission ; la creation du groupe
-                            // reprendra a la prochaine tentative de l'appelant.
                             pendingResult = resultat
                             demanderPermissionWifi()
                             return@setMethodCallHandler
                         }
                         gestionnaire.demarrerGroupe(nom) { ok, erreur ->
                             runOnUiThread {
-                                resultat.success(mapOf("ok" to ok, "erreur" to erreur))
+                                resultat.success(
+                                    mapOf("ok" to ok, "erreur" to erreur, "type" to "wifi_direct")
+                                )
                             }
                         }
                     }
-                    "arreter" -> gestionnaire.arreterGroupe { ok, erreur ->
-                        runOnUiThread {
-                            resultat.success(mapOf("ok" to ok, "erreur" to erreur))
+                    "arreter" -> {
+                        // On ferme les deux : un repli a pu laisser un groupe
+                        // Wi-Fi Direct ouvert pendant que le hotspot tournait.
+                        hotspot?.arreter { _, _ -> }
+                        gestionnaire.arreterGroupe { ok, erreur ->
+                            runOnUiThread {
+                                resultat.success(mapOf("ok" to ok, "erreur" to erreur))
+                            }
                         }
                     }
                     // --- role client (DT, spotter) ---
@@ -100,7 +144,13 @@ class MainActivity : FlutterActivity() {
                             resultat.success(mapOf("ok" to ok, "erreur" to erreur))
                         }
                     }
-                    "etat" -> resultat.success(mapOf("ok" to true) + gestionnaire.etat())
+                    "etat" -> {
+                        val etatHotspot = hotspot?.etat() ?: emptyMap()
+                        resultat.success(
+                            mapOf("ok" to true) + gestionnaire.etat() + etatHotspot +
+                                mapOf("typeHotspot" to (hotspot?.estDisponible() == true))
+                        )
+                    }
                     "clients" -> gestionnaire.clients { noms ->
                         runOnUiThread {
                             resultat.success(mapOf("ok" to true, "clients" to noms))

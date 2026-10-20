@@ -35,6 +35,15 @@ class BleProtocole {
   static const String typeAck = 'ACK';
   static const String typePing = 'PING';
 
+  /// Provisionnement reseau : l'excavatrice transmet le SSID et le mot de
+  /// passe du point d'acces qu'elle vient d'ouvrir.
+  ///
+  /// Sans cela, le client devrait les saisir a la main — et Android en
+  /// genere de nouveaux a chaque demarrage du point d'acces, donc la saisie
+  /// reviendrait chaque jour. Le message voyage **apres** le handshake, donc
+  /// uniquement vers un appareil deja authentifie par son identifiant.
+  static const String typeProvision = 'PROVISION';
+
   /// Longueur maximale d'un message encodé (garde-fou MTU).
   static const int octetsMax = 512;
 
@@ -85,6 +94,24 @@ class BleProtocole {
   /// identification + role, pour que TAB 2 decide d'autoriser ou non.
   /// [rssi] : RSSI mesure cote client (le peripherique Android ne peut pas
   /// le lire sur son propre lien), utilisé par TAB 2 pour la proximite.
+  /// Provisionnement reseau : SSID et mot de passe du point d'acces.
+  ///
+  /// `adresse` est l'IP du point d'acces (ex. `10.19.117.93`), pour que le
+  /// client joigne directement le serveur TCP sans balayer le sous-reseau.
+  static Map<String, Object?> provision({
+    required String ssid,
+    required String motDePasse,
+    String adresse = '',
+    int port = 45210,
+  }) =>
+      <String, Object?>{
+        'type': typeProvision,
+        'ssid': ssid,
+        'mot_de_passe': motDePasse,
+        'adresse': adresse,
+        'port': port,
+      };
+
   static Map<String, Object?> handshake({
     required String sourceDevice,
     required String role,

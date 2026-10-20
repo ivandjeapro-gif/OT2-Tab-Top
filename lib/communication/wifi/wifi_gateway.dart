@@ -277,13 +277,29 @@ class WifiClient {
   ///
   /// Retourne true si authentifié, false si TAB 2 est absent ou refuse —
   /// sans exception, l'appelant décide de retenter (REQ-008).
-  Future<bool> connecter({Duration delai = const Duration(seconds: 10)}) async {
+  Future<bool> connecter({
+    Duration delai = const Duration(seconds: 10),
+    String? adresseImposee,
+  }) async {
     if (_arrete) return false;
     ReseauWifi? cible;
-    await for (final ReseauWifi r in transport.scanner()) {
-      if (r.ssid.startsWith('ORE-EXC')) {
-        cible = r;
-        break;
+    // Adresse fournie par le provisionnement BLE : le point d'acces Android
+    // porte un SSID aleatoire (`AndroidShare_7741`), donc on ne peut pas le
+    // reconnaitre a son nom. L'excavatrice annonce son IP, on l'utilise
+    // directement et le scan devient inutile.
+    if (adresseImposee != null && adresseImposee.isNotEmpty) {
+      cible = ReseauWifi(
+        ssid: 'ORE-EXC',
+        adresse: adresseImposee,
+        puissance: 0,
+      );
+    }
+    if (cible == null) {
+      await for (final ReseauWifi r in transport.scanner()) {
+        if (r.ssid.startsWith('ORE-EXC')) {
+          cible = r;
+          break;
+        }
       }
     }
     if (cible == null) {
