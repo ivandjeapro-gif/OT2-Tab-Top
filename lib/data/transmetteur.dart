@@ -725,8 +725,19 @@ class TransmetteurHttp implements Transmetteur {
       recu = true;
       _serveurRepondu = true;
       final String t = reponse.body.trim();
+      if (reponse.statusCode == 401 || reponse.statusCode == 403) {
+        return 'ERREUR - jeton refuse (HTTP ${reponse.statusCode}) : le '
+            'api_token ne correspond pas au TOKEN du serveur Apps Script';
+      }
+      if (reponse.statusCode == 404) {
+        return 'ERREUR - adresse introuvable (HTTP 404) : verifiez l\'URL '
+            '_api_base, elle doit etre celle de la Web App deployee, finissant '
+            'par /exec';
+      }
       if (reponse.statusCode != 200) {
-        return 'ERREUR - HTTP ${reponse.statusCode} : ${_court(reponse.body)}';
+        return 'ERREUR - serveur en erreur (HTTP ${reponse.statusCode}) : '
+            '${_court(reponse.body)} - la Web App a peut-etre besoin d\'etre '
+            'redeployee';
       }
       if (!t.startsWith('{')) {
         return 'ERREUR - reponse non JSON (HTTP ${reponse.statusCode})';
@@ -752,8 +763,44 @@ class TransmetteurHttp implements Transmetteur {
           '(HTTP ${reponse.statusCode})${resume.isEmpty ? '' : ' - $resume'}';
     } catch (e) {
       _serveurRepondu = recu;
-      return 'ERREUR - serveur injoignable : ${_court('$e')}';
+      return 'ERREUR - ${_causeReseau(e)} : ${_court('$e')}';
     }
+  }
+
+  /// Traduit une exception de transport en cause lisible sur le terrain.
+  ///
+  /// "Serveur injoignable" oblige le technicien a deviner s'il doit chercher
+  /// du reseau, corriger l'URL ou changer le jeton. Ces quatre causes se
+  /// distinguent pourtant sans ambiguite dans le message d'erreur.
+  static String _causeReseau(Object e) {
+    final String t = '$e';
+    if (t.contains('Failed host lookup') ||
+        t.contains('No address associated with hostname')) {
+      return 'pas de reseau ou DNS absent - verifiez le Wi-Fi ou la 4G de la '
+          'tablette, puis reessayez';
+    }
+    if (t.contains('Network is unreachable') ||
+        t.contains('No route to host')) {
+      return 'reseau connecte sans acces Internet - ce Wi-Fi n\'a pas de '
+          'passerelle : utilisez un reseau qui donne acces a Internet';
+    }
+    if (t.contains('Connection refused')) {
+      return 'adresse joignable mais port ferme - l\'URL vise probablement un '
+          'mauvais hote';
+    }
+    if (t.contains('HandshakeException') || t.contains('CERTIFICATE')) {
+      return 'certificat TLS refuse - seule une URL https Authenticode valide '
+          'est acceptee';
+    }
+    if (t.contains('TimeoutException') || t.contains('timed out')) {
+      return 'serveur muet (delai depasse) - reseau lent ou Web App '
+          'desactivee ; reessayez puis verifiez le deploiement Apps Script';
+    }
+    if (t.contains('FormatException') || t.contains('Uri')) {
+      return 'URL invalide - attendu une adresse complete commencant par '
+          'https:// et finissant par /exec';
+    }
+    return 'serveur injoignable';
   }
 
   /// Une erreur tient en une ligne du journal, pas en un dump HTML.

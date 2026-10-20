@@ -116,10 +116,28 @@ class WifiDirectManager(private val context: Context) {
         onResultat: (Boolean, String?) -> Unit
     ) {
         val m = manager ?: return
-        val config = WifiP2pConfig.Builder()
-            .setNetworkName(nomGroupe)
-            .setPassphrase(MOT_DE_PASSE)
-            .build()
+        // Android 10+ (et Android 15 de facon stricte) impose un nom de
+        // groupe commencant par `DIRECT-` suivi de deux caracteres
+        // alphanumeriques : `setNetworkName` LEVE IllegalArgumentException
+        // sinon, et l'exception remonte sur le thread principal (crash de
+        // l'application). On ne peut donc pas y passer `ORE-EXC-001`.
+        //
+        // Le nom applicatif reste connu des tablettes : il passe par le
+        // SSID du groupe, que l'on retrouve cote client via `wifiP2pInfo`.
+        val nomConforme = nomGroupeDirect(nomGroupe)
+        val config = try {
+            WifiP2pConfig.Builder()
+                .setNetworkName(nomConforme)
+                .setPassphrase(MOT_DE_PASSE)
+                .build()
+        } catch (e: IllegalArgumentException) {
+            // Ceinture et bretelles : une configuration refusee par le
+            // framework ne doit jamais faire tomber l'application, qui doit
+            // rester capable de travailler en TCP sur un reseau existant.
+            Log.w(TAG, "Configuration du groupe refusee ($nomGroupe)", e)
+            onResultat(false, "nom de groupe refuse par Android : ${e.message}")
+            return
+        }
 
         m.createGroup(c, config, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
@@ -135,6 +153,26 @@ class WifiDirectManager(private val context: Context) {
                 onResultat(false, "creation du groupe refusee (code $raison)")
             }
         })
+    }
+
+    /**
+     * Rend un nom de groupe acceptable par le framework Wi-Fi Direct.
+     *
+     * Format impose : `DIRECT-` + exactement deux caracteres alphanumeriques
+     * (ex. `DIRECT-XY`). Un nom deja conforme est retourne tel quel ; sinon on
+     * derive deux caracteres stables du nom applicatif, afin que toutes les
+     * tablettes retrouvent le meme groupe d'une session a l'autre.
+     */
+    private fun nomGroupeDirect(nom: String): String {
+        val prefixe = "DIRECT-"
+        val brut = (nom.ifBlank { "ORE" }).uppercase().filter { it.isLetterOrDigit() }
+        if (brut.startsWith("DIRECT") && brut.length == prefixe.length + 2) {
+            return brut
+        }
+        // Deux caracteres derives du nom : deterministes, donc le groupe
+        // garde la meme identite apres redemarrage de l'application.
+        val deux = (brut + "XY").take(2)
+        return prefixe + deux
     }
 
     /** Ferme le groupe (l'excavatrice cesse d'etre point d'acces). */

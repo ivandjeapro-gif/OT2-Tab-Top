@@ -912,9 +912,16 @@ class BaseLocale {
       );
 
   /// Profil de ce [code], ou null s'il n'existe pas.
+  ///
+  /// La comparaison ignore la casse : la feuille du serveur ecrit ses codes en
+  /// majuscules (`DT`, `EXCAVATOR`, `SPOT`) alors que le reste de l'application
+  /// les emploie en minuscules. Sans cela, les profils etaient bien recus mais
+  /// jamais retrouves, et l'ecran de connexion restait sur « Aucun profil
+  /// configure ».
   Profil? profil(String code) {
+    final String cible = code.trim().toLowerCase();
     for (final Profil profil in _profils) {
-      if (profil.code == code) return profil;
+      if (profil.code.trim().toLowerCase() == cible) return profil;
     }
     return null;
   }
@@ -926,30 +933,50 @@ class BaseLocale {
   Profil? profilDuRole(String role) {
     Profil? premier;
     for (final Profil profil in _profils) {
-      if (profil.roleCdc != role) continue;
+      // Les trois ecritures (`ROLE_TAB1`, `SPOTTER`, `SPOT`... ) designent le
+      // meme role : la base du serveur ecrit volontiers le nom court, tandis
+      // que le code historique attend le nom CDC. Comparer les deux chaines
+      // a l'identique laissait `idsDuRole` vide et l'excavatrice refusait
+      // alors tous les spotters et tous les DT ("non enrole").
+      if (!memeRole(profil.roleCdc, role)) continue;
       if (profil.actif) return profil;
       premier ??= profil;
     }
     return premier;
   }
 
+  /// Deux roles designent-ils la meme tablette ?
+  ///
+  /// `ROLE_TAB2`, `DT` et `TAB2` sont le meme role ; l'inverse aussi. C'est la
+  /// seule comparaison a utiliser d'un bout a l'autre de l'application.
+  static bool memeRole(String a, String b) =>
+      estTab1(a) && estTab1(b) || estTab2(a) && estTab2(b) || estTab3(a) && estTab3(b);
+
   /// Remplace atomiquement les referentiels administres par le serveur.
   ///
   /// Un snapshot incomplet est refuse avant l'ecriture; les listes memoire ne
   /// changent qu'apres la transaction SQLite.
   Future<void> appliquerReferentiels(ReferentielsServeur snapshot) async {
-    if (snapshot.profils.isEmpty || snapshot.typesDT.isEmpty) {
+    // Seuls les profils sont indispensables a la connexion. Les familles de
+    // DT servent au formulaire du spotter : une feuille qui n'en publie pas
+    // encore ne doit pas bloquer les trois tablettes (« Aucun profil
+    // configure », alors que le referentiel est bien recu).
+    if (snapshot.profils.isEmpty) {
       throw const FormatException('Referentiels serveur incomplets');
     }
+    // Les liens entre tables se font en minuscules : la feuille du serveur
+    // ecrit ses codes en majuscules, les equipements peuvent en employer une
+    // autre. C'est la meme regle que [profil].
+    String bas(String s) => s.trim().toLowerCase();
     final Set<String> codesProfils = <String>{
-      for (final Profil profil in snapshot.profils) profil.code,
+      for (final Profil profil in snapshot.profils) bas(profil.code),
     };
     final Set<String> codesTypes = <String>{
-      for (final TypeDT type in snapshot.typesDT) type.code,
+      for (final TypeDT type in snapshot.typesDT) bas(type.code),
     };
     final Set<String> equipementsUniques = <String>{
       for (final EquipementServeur e in snapshot.equipements)
-        '${e.profil}\u0000${e.id}',
+        '${bas(e.profil)}\u0000${e.id}',
     };
     final List<String> identifiantsDT = <String>[
       for (final TypeDT type in snapshot.typesDT) ...type.ids,
@@ -957,17 +984,18 @@ class BaseLocale {
     final Set<String> identifiantsDTUniques = identifiantsDT.toSet();
     final Set<String> equipementsActifs = <String>{
       for (final EquipementServeur e in snapshot.equipements)
-        if (e.actif) e.profil,
+        if (e.actif) bas(e.profil),
     };
     if (codesProfils.length != snapshot.profils.length ||
         codesTypes.length != snapshot.typesDT.length ||
         snapshot.equipements.any((EquipementServeur e) =>
-            !codesProfils.contains(e.profil)) ||
+            !codesProfils.contains(bas(e.profil))) ||
         equipementsUniques.length != snapshot.equipements.length ||
-        snapshot.typesDT.any((TypeDT type) => type.ids.isEmpty) ||
+        // Une famille sans aucun numero est ignoree au chargement (le menu
+        // du spotter ne l'affichera pas) : elle ne rend pas le lot incoherent.
         identifiantsDTUniques.length != identifiantsDT.length ||
         snapshot.profils.any((Profil p) =>
-            p.actif && !equipementsActifs.contains(p.code))) {
+            p.actif && !equipementsActifs.contains(bas(p.code)))) {
       throw const FormatException('Referentiels serveur incoherents');
     }
     final Database? db = _db;
@@ -982,8 +1010,13 @@ class BaseLocale {
         }
         for (final EquipementServeur equipement in snapshot.equipements) {
           if (!equipement.actif) continue;
+          // Meme comparaison souple que le remplissage memoire : une
+          // difference de casse entre `profils.code` et `identifiants.profil`
+          // ne doit pas faire echouer l'ecriture disque.
           final Profil profil = snapshot.profils.firstWhere(
-            (Profil p) => p.code == equipement.profil,
+            (Profil p) =>
+                p.code.trim().toLowerCase() ==
+                equipement.profil.trim().toLowerCase(),
           );
           await txn.insert('equipements', <String, Object?>{
             'role': profil.roleCdc,
@@ -1009,6 +1042,11 @@ class BaseLocale {
 
   void _appliquerReferentielsMemoire(ReferentielsServeur snapshot) {
     _profils = List<Profil>.of(snapshot.profils);
+    // Rattachement equipement -> profil insensible a la casse, comme partout
+    // ailleurs : la feuille ecrit `DT` cote profils et peut ecrire `dt` cote
+    // identifiants, ou l'inverse. Une egalite stricte laissait `_equipements`
+    // vide, donc `idsDuRole` vide, donc l'excavatrice affichait
+    // « 0 appareil(s) autorise(s) » et refusait toutes les tablettes.
     _equipements
       ..clear()
       ..addEntries(
@@ -1016,7 +1054,9 @@ class BaseLocale {
               p.code,
               <({String id, String nom})>[
                 for (final EquipementServeur e in snapshot.equipements)
-                  if (e.profil == p.code && e.actif)
+                  if (e.actif &&
+                      e.profil.trim().toLowerCase() ==
+                          p.code.trim().toLowerCase())
                     (id: e.id, nom: e.nom),
               ],
             )),

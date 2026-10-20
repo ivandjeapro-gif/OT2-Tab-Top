@@ -183,12 +183,17 @@ class Synchronisation extends ChangeNotifier {
     if (!reseauDisponible && !forcer) return;
     final ReferentielsServeur? snapshot =
         await transmetteur.lireReferentiels();
-    if (snapshot == null) return;
+    if (snapshot == null) {
+      _dire('Referentiels : aucune reponse exploitable du serveur');
+      return;
+    }
     try {
       await base.appliquerReferentiels(snapshot);
     } on Object catch (e) {
       base.journaliser('REFERENTIELS refuses : $e');
-      _dire('Referentiels serveur invalides - listes locales conservees');
+      // Le motif est repris tel quel : sans lui, l'ecran reste bloque sur
+      // « Aucun profil configure » sans que personne ne sache pourquoi.
+      _dire('Referentiels refuse par l\'app : $e');
       return;
     }
     _dire(
