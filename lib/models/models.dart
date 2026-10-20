@@ -109,8 +109,13 @@ class TypeDT {
 
   int get nombreDts => ids.length;
 
-  /// Nom affiche par la liste deroulante : « DT 1500 ».
-  String get libelle => 'DT $code';
+  /// Nom affiche par la liste deroulante.
+  ///
+  /// L'onglet `dts` porte des familles deja nommees (`1500`, `785`, `ADT`) :
+  /// on prefixe `DT` pour les familles numeriques (« DT 1500 ») et on laisse
+  /// `ADT` tel quel, sans produire « DT ADT ». Un code vide rend « DT ».
+  String get libelle =>
+      code.isEmpty ? 'DT' : (code.startsWith('ADT') ? code : 'DT $code');
 
   /// Vrai si ce numero appartient bien a ce type de DT.
   bool contient(String id) => ids.contains(id);

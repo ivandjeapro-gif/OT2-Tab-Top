@@ -1,7 +1,8 @@
 ﻿import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
-
 import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 
 import '../models/models.dart';
@@ -93,6 +94,18 @@ class BaseLocale {
   static bool estTab3(String role) {
     final String r = role.toUpperCase();
     return r == roleTab3 || r == 'EXCAVATOR' || r == 'EXCAVATRICE';
+  }
+
+  /// Vrai si [role] designe le spotter (SPOTTER ou SPOT).
+  ///
+  /// Le spotter n'embarque **aucun recepteur GNSS** : sa tablette ne sait pas
+  /// se localiser. Le service de position ne doit donc pas etre demarre pour
+  /// lui, sinon chaque « mesure » reellement indisponible produit un
+  /// `GPS_UPDATE` inutile dans la file d'evenements — et le compteur
+  /// d'attente affiche des evenements que l'utilisateur n'a jamais crees.
+  static bool estSpotter(String role) {
+    final String r = role.toUpperCase();
+    return r == 'SPOTTER' || r == 'SPOT';
   }
 
   /// Versions visibles par l'application, ecrites dans `meta` a la creation.
@@ -242,6 +255,11 @@ class BaseLocale {
         debugPrint('Migration blocs : $orphelins bloc(s) sans RL supprime(s)');
       }
       await _recharger(db);
+      // Le compteur d'attente doit refleter le DISQUE, pas l'etat d'il y a
+      // une session. Sans ce comptage, la supervision affichait 0 evenement
+      // en attente apres un redemarrage, alors que la file en contenait
+      // encore : impossible de savoir s'il restait quelque chose a envoyer.
+      await _recalculerAttente(db);
     } catch (e) {
       _db = null;
       debugPrint('Base locale indisponible (fonctionnement en memoire) : $e');
@@ -1299,6 +1317,12 @@ class BaseLocale {
     await _recalculerAttente(db);
   }
 
+  /// Recompte les evenements PENDING et met [nombreEnAttente] a jour.
+  ///
+  /// Appele apres CHAQUE transition d'etat (SYNCED, retour en PENDING) et
+  /// desormais A L'OUVERTURE de la base. Sans ce dernier appel, le compteur
+  /// repartait a 0 au redemarrage alors que des evenements attendaient
+  /// encore : la supervision affichait un chiffre inferieur a la realite.
   Future<void> _recalculerAttente(Database db) async {
     _enAttente = Sqflite.firstIntValue(
           await db.rawQuery(
@@ -1666,6 +1690,16 @@ class BaseLocale {
       );
     }
 
+    // URL des plans : on enregistre l'URL de CHAQUE carte du blast (une par
+    // RL). `blast.plan` ne peut porter qu'une seule URL, celle de la premiere
+    // carte ; sans cette table, changer de RL ne changerait pas le plan.
+    for (final BlastServeur serveur in liste) {
+      if (serveur.planUrl.isNotEmpty) {
+        poserUrlPlan(serveur.carte, serveur.planUrl);
+      }
+      serveur.planUrlParCarte.forEach(poserUrlPlan);
+    }
+
     for (final BlastServeur serveur in liste) {
       if (serveur.numero.isEmpty || serveur.carte.isEmpty) continue;
       final Blast? existant = parNumero(serveur.numero);
@@ -1840,24 +1874,95 @@ class BaseLocale {
   /// Chemins locaux des plans deja telecharges, par code de carte.
   final Map<String, String> _plansLocaux = <String, String>{};
 
+  /// URL serveur de chaque carte, lue a la reception des blasts.
+  ///
+  /// Un blast couvre N cartes (une par RL) : `blast.plan` ne peut en porter
+  /// qu'une. Cette table est la seule source pour afficher le plan du RL
+  /// selectionne tant qu'il n'est pas encore telecharge en local.
+  final Map<String, String> _planUrls = <String, String>{};
+
   /// Chemin du plan local pour une carte donnee, si telecharge.
   String? planDe(String carte) => _plansLocaux[carte];
 
+  /// Plan d'une carte, dans l'ordre de preference :
+  /// 1. fichier local deja telecharge ;
+  /// 2. URL serveur de CETTE carte (pas celle de la premiere du blast) ;
+  /// 3. URL Apps Script construite a la volee `?action=plan&carte=<code>`.
+  ///
+  /// Le repli 3 est indispensable : tant que la synchro n'a pas tourne depuis
+  /// le deploiement serveur qui renvoie `blocs_par_carte[].plan_url`, la table
+  /// [_planUrls] est vide et `planCourant` retomberait sur `blast.plan`, qui
+  /// ne porte QUE la premiere carte du blast (bug RL 262.5 -> plan 260).
+  ///
+  /// Rend `null` seulement si le code de carte est vide.
+  String? planPourCarte(String carte) {
+    if (carte.isEmpty) return null;
+    final String? local = _plansLocaux[carte];
+    if (local != null && local.isNotEmpty) return local;
+    final String? url = _planUrls[carte];
+    if (url != null && url.isNotEmpty) return url;
+    // Repli : URL du plan de CETTE carte, derivee du code seul. Le serveur
+    // resout le fichier Drive par son nom de base, donc le code suffit.
+    final String base = _baseServeur;
+    if (base.isEmpty) return null;
+    final String sep = base.contains('?') ? '&' : '?';
+    return '$base${sep}action=plan&carte=${Uri.encodeComponent(carte)}';
+  }
+
+  /// Racine de l'URL de la Web App (sans `?action=...`), posee a la
+  /// configuration des parametres. Sert au repli de [planPourCarte].
+  String _baseServeur = '';
+
+  /// Enregistre la racine de la Web App pour construire les URL de plans
+  /// a la volee. Appele a la configuration des parametres serveur.
+  void poserBaseServeur(String url) {
+    _baseServeur = url.trim();
+  }
+
+  /// URL serveur connue pour une carte (null si jamais recue).
+  String? urlPlanDe(String carte) => _planUrls[carte];
+
+  /// Enregistre l'URL serveur d'une carte (reception des blasts).
+  void poserUrlPlan(String carte, String url) {
+    if (carte.isEmpty || url.isEmpty) return;
+    _planUrls[carte] = url;
+  }
+
   /// Pose le chemin local d'un plan telecharge : les blasts de cette carte
   /// lisent desormais le fichier au lieu de l'URL serveur.
+  /// Pose le chemin local d'un plan telecharge, POUR CETTE CARTE seulement.
+  ///
+  /// `blast.plan` n'est PAS mis a jour : un blast multi-RL a plusieurs plans
+  /// et cette colonne ne peut en porter qu'un. La source de verite est
+  /// [_plansLocaux], indexee par code de carte.
   void poserPlanLocal(String carte, String cheminFichier) {
+    if (carte.isEmpty || cheminFichier.isEmpty) return;
     _plansLocaux[carte] = cheminFichier;
-    for (final Blast blast in blasts) {
-      if (!blast.cartes.contains(carte)) continue;
-      blast.plan = cheminFichier;
-      _ecrire(
-        (Database db) => db.update(
-          'blasts',
-          <String, Object?>{'plan': cheminFichier},
-          where: 'carte = ?',
-          whereArgs: <Object?>[carte],
-        ),
-      );
+  }
+
+  /// Charge au demarrage les plans deja telecharges dans le dossier
+  /// documents de l'application (`plan_<code>.<ext>`).
+  ///
+  /// Sans ce scan, [_plansLocaux] serait vide apres un redemarrage et le
+  /// client retomberait sur les URL serveur a chaque ouverture de carte.
+  Future<void> chargerPlansLocaux() async {
+    // Racine de la Web App : relue du meta avant tout, elle sert au repli de
+    // `planPourCarte` quand l'URL d'une carte n'a pas encore ete recue.
+    final String apiBase = meta('api_base') ?? '';
+    if (apiBase.isNotEmpty) poserBaseServeur(apiBase);
+    try {
+      final Directory dossier = await getApplicationDocumentsDirectory();
+      if (!await dossier.exists()) return;
+      final RegExp motif = RegExp(r'^plan_(.+)\.(jpg|jpeg|png|gif)$');
+      await for (final FileSystemEntity entite in dossier.list()) {
+        if (entite is! File) continue;
+        final String nom = entite.uri.pathSegments.last;
+        final RegExpMatch? m = motif.firstMatch(nom);
+        if (m == null) continue;
+        _plansLocaux[m.group(1)!] = entite.path;
+      }
+    } catch (e) {
+      debugPrint('Chargement des plans locaux impossible : $e');
     }
   }
 

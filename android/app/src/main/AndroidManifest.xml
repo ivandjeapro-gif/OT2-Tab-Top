@@ -9,6 +9,15 @@
          a l'installation. -->
     <uses-permission android:name="android.permission.VIBRATE"/>
 
+    <!-- Appareil photo : requis par le formulaire « Nouvelle ligne »
+         (bouton Picture -> source « Appareil photo »). Sans cette
+         declaration, `image_picker` leve une erreur et la camera ne
+         s'ouvre jamais, meme apres autorisation runtime.
+         `required="false"` : l'application reste installable sur un
+         appareil sans camera (la galerie suffit alors). -->
+    <uses-permission android:name="android.permission.CAMERA"/>
+    <uses-feature android:name="android.hardware.camera" android:required="false"/>
+
     <!-- Couche BLE TAB 3 <-> TAB 2 (CDC §7, §8, REQ-004/005/006/017) :
          decouverte BLE, connexion, RSSI pour le controle de proximite.
          La localisation fine est requise par Android < 12 pour scanner,
@@ -87,6 +96,13 @@
              voix off reste muette sur les tablettes Android >= 30. -->
         <intent>
             <action android:name="android.intent.action.TTS_SERVICE"/>
+        </intent>
+        <!-- Appareil photo (image_picker, formulaire « Nouvelle ligne ») :
+             Android 11+ filtre la resolution des activites. Sans cet intent,
+             `pickImage(source: camera)` echoue avec "No Activity found"
+             meme si la permission CAMERA est accordee. -->
+        <intent>
+            <action android:name="android.media.action.IMAGE_CAPTURE"/>
         </intent>
     </queries>
 </manifest>

@@ -128,6 +128,7 @@ class BlastServeur {
     this.cartes = const <String>[],
     this.blocsParCarte = const <String, List<String>>{},
     this.flitchParCarte = const <String, String>{},
+    this.planUrlParCarte = const <String, String>{},
     this.libelleCarte = '',
     this.planUrl = '',
   });
@@ -167,6 +168,13 @@ class BlastServeur {
   /// URL du plan JPG de la carte, vide si le serveur n'en fournit pas.
   final String planUrl;
 
+  /// URL du plan pour CHAQUE carte du blast (une par RL).
+  ///
+  /// Un blast peut couvrir plusieurs RL (ex. 113 = flitch 260 + flitch 262.5).
+  /// `planUrl` ne porte que la premiere carte ; cette table permet d'afficher
+  /// le bon plan quand l'utilisateur change de RL.
+  final Map<String, String> planUrlParCarte;
+
   /// Parse la reponse du serveur. Un champ manquant ne bloque pas la liste :
   /// le blast arrive avec ce qui est la, le reste suivra a la prochaine
   /// passe (un blast sans numero est simplement ignore).
@@ -191,6 +199,7 @@ class BlastServeur {
             ],
             blocsParCarte: _lireBlocsParCarte(item['blocs_par_carte']),
             flitchParCarte: _lireFlitchParCarte(item['blocs_par_carte']),
+            planUrlParCarte: _lirePlanUrlParCarte(item['blocs_par_carte']),
             libelleCarte: '${item['libelle_carte'] ?? ''}',
             blocs: <String>[
               if (item['blocs'] is List)
@@ -229,6 +238,20 @@ class BlastServeur {
       final String flitch = '${item['flitch'] ?? ''}'.trim();
       if (carte.isEmpty || flitch.isEmpty) continue;
       sortie[carte] = flitch;
+    }
+    return sortie;
+  }
+
+  /// Lit le `plan_url` declare par le serveur pour chaque carte (un par RL).
+  static Map<String, String> _lirePlanUrlParCarte(Object? brut) {
+    if (brut is! List) return const <String, String>{};
+    final Map<String, String> sortie = <String, String>{};
+    for (final Object? item in brut) {
+      if (item is! Map<String, Object?>) continue;
+      final String carte = '${item['carte'] ?? ''}'.trim();
+      final String url = '${item['plan_url'] ?? ''}'.trim();
+      if (carte.isEmpty || url.isEmpty) continue;
+      sortie[carte] = url;
     }
     return sortie;
   }

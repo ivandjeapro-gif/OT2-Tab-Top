@@ -104,6 +104,10 @@ class Session extends ChangeNotifier {
   /// fonctionnent exactement comme en production.
   Future<void> ouvrirBase({bool demoOffroad = false}) async {
     await base.ouvrir();
+    // Plans deja telecharges lors d'une session precedente : sans ce scan,
+    // ils seraient oublies au redemarrage et l'ecran afficherait de nouveau
+    // l'URL reseau (ou le plan de la premiere carte) pour chaque RL.
+    await base.chargerPlansLocaux();
     demarrerSurveillanceReseau();
     // Première alimentation des listes de login (profils, équipements, DT)
     // avant d'afficher l'écran de connexion. Hors réseau, la base locale
@@ -134,22 +138,32 @@ class Session extends ChangeNotifier {
     // file d'evenements. Sur desktop sans capteur, le service reste
     // silencieux sans jamais planter. L'abonnement aux mesures se pose
     // AVANT le demarrage : la premiere mesure ne peut pas passer a cote.
-    servicePosition = ServicePosition(
-      base: base,
-      fournisseur: demoOffroad
-          ? GpsDemoOffroad(
-              figerAlerte: true,
-              // Depart du scÃ©nario = le DEPOT connu de la base, en UTM : le
-              // DT simulÃ© part du meme point que la carte affiche.
-              eastingDepart: _demoEastingDepart,
-              northingDepart: _demoNorthingDepart,
-            )
-          : null,
-      intervalle: _intervalleGps,
-      filtreDistance: _filtreGps,
-    );
-    _subMesures ??= servicePosition!.mesures.listen(traiterMesure);
-    servicePosition!.demarrer();
+    //
+    // EXCEPTION SPOTTER : sa tablette n'embarque aucun recepteur GNSS. Faire
+    // demarrer le service produirait des `GPS_UPDATE` fantomes dans la file
+    // d'evenements (compteur « en attente » gonfle par des mesures que
+    // l'utilisateur n'a jamais prises). Le mode demo reste prioritaire : il
+    // alimente un scenario fictif, quel que soit le profil.
+    final bool gpsUtile = demoOffroad ||
+        !BaseLocale.estSpotter(profile?.roleCdc ?? '');
+    if (gpsUtile) {
+      servicePosition = ServicePosition(
+        base: base,
+        fournisseur: demoOffroad
+            ? GpsDemoOffroad(
+                figerAlerte: true,
+                // Depart du scÃ©nario = le DEPOT connu de la base, en UTM : le
+                // DT simulÃ© part du meme point que la carte affiche.
+                eastingDepart: _demoEastingDepart,
+                northingDepart: _demoNorthingDepart,
+              )
+            : null,
+        intervalle: _intervalleGps,
+        filtreDistance: _filtreGps,
+      );
+      _subMesures ??= servicePosition!.mesures.listen(traiterMesure);
+      servicePosition!.demarrer();
+    }
     if (demoOffroad) {
       push('Scenario de demonstration : sortie de parcours en cours');
     }
@@ -680,11 +694,20 @@ class Session extends ChangeNotifier {
   }
 
   /// Plan JPG/PNG de la carte courante (selon le RL choisi).
+  ///
+  /// Priorite stricte carte par carte : le plan local du RL courant s'il est
+  /// telecharge, sinon l'URL serveur de CE RL. Le plan du blast n'est qu'un
+  /// dernier recours (ancien format a une seule carte).
   String? get planCourant {
     final String c = carteCourante;
     if (c.isNotEmpty) {
-      final String? local = base.planDe(c);
-      if (local != null && local.isNotEmpty) return local;
+      final String? plan = base.planPourCarte(c);
+      if (plan != null && plan.isNotEmpty) return plan;
+      // AUCUN repli sur `blast.plan` quand une carte precise est demandee :
+      // cette colonne ne porte que le plan de la PREMIERE carte du blast.
+      // Y retomber afficherait le plan du RL 260 alors que le 262.5 est
+      // selectionne. Mieux vaut un etat vide explicite qu'une mauvaise carte.
+      return null;
     }
     return blast?.plan;
   }

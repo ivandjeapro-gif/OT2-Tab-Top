@@ -130,6 +130,11 @@ class _ParametresScreenState extends State<ParametresScreen> {
 
     await base.majMeta('api_base', apiBase);
     await base.majMeta('api_token', _apiToken.text.trim());
+    // Racine de la Web App : sert au repli de `planPourCarte`, qui construit
+    // `?action=plan&carte=<code>` pour un RL dont l'URL n'a pas encore ete
+    // recue par la synchro. Sans cela, un blast multi-RL retombe sur le plan
+    // de sa premiere carte.
+    base.poserBaseServeur(apiBase);
     await base.majMeta('envoi_mode', _envoiMode);
     await base.majMeta('seuil_entree_m', entree.toString());
     await base.majMeta('seuil_sortie_m', sortie.toString());

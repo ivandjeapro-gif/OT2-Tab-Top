@@ -63,10 +63,37 @@ class _SpotterScreenState extends State<SpotterScreen> {
   /// cette famille. Les identifiants etant non redondants sur tout le parc,
   /// le second menu ne propose jamais le meme numero ailleurs.
   Future<void> _addRecord() async {
+    // Double-tap : deux dialogues empiles ecriraient deux fois la meme ligne.
+    if (_formulaireOuvert) return;
+
     final Blast? blast = _blast;
     final BlocTravail? bloc = _bloc;
     if (blast == null || bloc == null || bloc.verrouille) return;
 
+    // Referentiels absents : `typesDT.first` jetterait une exception sur une
+    // liste vide. On informe plutot que de laisser l'ecran planter.
+    if (session.base.typesDT.isEmpty) {
+      session.push(
+        'Aucune famille de DT enregistree - lancez Actualiser',
+      );
+      return;
+    }
+
+    _formulaireOuvert = true;
+    try {
+      await _afficherFormulaireLigne(blast, bloc);
+    } finally {
+      _formulaireOuvert = false;
+    }
+  }
+
+  /// Garde anti double-tap sur le bouton `+`.
+  bool _formulaireOuvert = false;
+
+  Future<void> _afficherFormulaireLigne(
+    Blast blast,
+    BlocTravail bloc,
+  ) async {
     final TextEditingController comment = TextEditingController();
     // Message d'erreur du formulaire : affiche DANS le dialogue, jamais en
     // fermant, sinon la photo prise et le commentaire tape seraient perdus.
@@ -112,10 +139,16 @@ class _SpotterScreenState extends State<SpotterScreen> {
             final ImagePicker picker = ImagePicker();
             XFile? capture;
             try {
+              // Resolution et qualite volontairement basses : la photo sert
+              // de preuve sur une ligne de tir, pas d'archive. A 1600 px / 85
+              // la tablette passait plusieurs secondes a recompresser apres
+              // la prise de vue (d'ou la latence ressentie avant l'affichage
+              // de la vignette). 1024 px / 70 reste lisible une fois zoome
+              // et divise le temps de traitement par trois environ.
               capture = await picker.pickImage(
                 source: source,
-                maxWidth: 1600,
-                imageQuality: 85,
+                maxWidth: 1024,
+                imageQuality: 70,
               );
             } catch (e) {
               if (!context.mounted) return;
@@ -249,9 +282,11 @@ class _SpotterScreenState extends State<SpotterScreen> {
                     color: AppColors.greyBg,
                     border: Border.all(color: AppColors.border),
                   ),
+                  // `blast.carte` est la PREMIERE carte du blast ; sur un
+                  // blast multi-RL la ligne appartient au RL selectionne.
                   child: Text(
                     'Blast ${blast.numero}   Bloc ${bloc.numero}   '
-                    'Carte ${blast.carte}',
+                    'Carte ${session.carteCourante.isNotEmpty ? session.carteCourante : blast.carte}',
                     style: TextStyle(
                       fontFamily: kSerif,
                       fontSize: (13 * MiseEnPage.depuis(context).k).clamp(10.0, 13.0),
@@ -260,6 +295,31 @@ class _SpotterScreenState extends State<SpotterScreen> {
                   ),
                 ),
                 const SizedBox(height: 16),
+                // Referentiels absents : sans famille de DT le formulaire ne
+                // peut rien produire. On le dit au lieu d'afficher un menu
+                // vide que l'utilisateur prendrait pour un bug.
+                if (session.base.typesDT.isEmpty)...[
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: AppColors.greyBg,
+                      border: Border.all(color: AppColors.border),
+                    ),
+                    child: Text(
+                      'Aucune famille de DT enregistree.\n'
+                      'Fermez ce formulaire puis lancez Actualiser sur l ecran '
+                      'de connexion.',
+                      style: TextStyle(
+                        fontFamily: kSerif,
+                        fontSize:
+                            (13 * MiseEnPage.depuis(context).k).clamp(10.0, 13.0),
+                        color: AppColors.slate,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                ],
                 // Liste 1 : la famille de DT (DT 1500, DT 785, DT 1000...).
                 // Une vraie liste deroulante : on clique, elle s'ouvre, on
                 // choisit. Le menu affiche le nombre de DT de chaque famille.
@@ -284,7 +344,11 @@ class _SpotterScreenState extends State<SpotterScreen> {
                     for (final TypeDT option in session.base.typesDT)
                       DropdownMenuItem<String>(
                         value: option.code,
-                        child: Text('${option.libelle}  (${option.nombreDts})'),
+                        // La famille porte deja son prefixe (« DT 1500 »,
+                        // « ADT ») : on n'en ajoute pas un second.
+                        child: Text(
+                          '${option.libelle}  (${option.nombreDts})',
+                        ),
                       ),
                   ],
                   onChanged: (String? code) {
@@ -336,7 +400,10 @@ class _SpotterScreenState extends State<SpotterScreen> {
                     for (final String id in session.idsDuType(typeChoisi))
                       DropdownMenuItem<String>(
                         value: id,
-                        child: Text('DT $id'),
+                        // Le numero est nu dans la base (« 5 ») : c'est
+                        // l'identifiant unique sur tout le parc, pas un
+                        // code a prefixer.
+                        child: Text(id),
                       ),
                   ],
                   onChanged: (String? id) =>
@@ -743,69 +810,47 @@ class _SpotterScreenState extends State<SpotterScreen> {
     if (choisi != null) session.selectionnerBloc(choisi);
   }
 
-  /// Ouvre le plan du blast courant dans une fenetre, en pleine place.
+  /// Ouvre le plan du blast courant en PLEIN ECRAN.
   ///
-  /// Le bouton `Afficher map` n'a aucun menu : la carte est deja celle du
-  /// blast, il n'y a rien a choisir. Il sert juste a voir le plan, que la
-  /// vignette du bouton est trop petite pour lire.
+  /// La vignette du bouton `Afficher map` est trop petite pour lire un plan
+  /// de tir : un tap ouvre une fenetre plein cadre, fond noir, avec
+  /// pinch-to-zoom (deux doigts) et double-tap pour zoomer/dezoomer.
+  ///
+  /// Un tap simple sur le fond noir ferme la fenetre ; le bouton explicite
+  /// `Fermer` reste dans le bandeau pour les utilisateurs qui le preferent.
   void _afficherCarte() {
     final Blast? blast = _blast;
     if (blast == null) return;
 
-    final Size ecran = MediaQuery.sizeOf(context);
-    // Le plan est cale sur la fenetre (titre + boutons prennent le reste) :
-    // un multiple fixe de la hauteur debordait des la fenetre basse. Le
-    // defilement de secours couvre le cas ou la boite reste trop haute.
-    final double largeur = (ecran.width * 0.7).clamp(0.0, 720.0).toDouble();
-    final double hauteur = (ecran.height * 0.45).clamp(0.0, 480.0).toDouble();
     final String codeCarte = session.carteCourante.isNotEmpty
         ? session.carteCourante
         : blast.carte;
     final String libelle = session.base.libelleCarte(codeCarte) ?? '';
+    // Pas de repli sur `blast.plan` : il ne porte que la carte du premier RL.
+    final String chemin = session.planCourant ?? '';
 
-    showDialog<void>(
+    // Diagnostic : trace la chaine complete RL -> carte -> plan. Permet de
+    // verifier depuis `adb logcat` que le changement de RL change bien de
+    // carte et de plan, sans deviner.
+    debugPrint('[CARTE] blast=${blast.numero} rl=${session.rlCourant} '
+        'cartes=${blast.cartes} -> carte=$codeCarte '
+        'plan=$chemin');
+
+    showGeneralDialog<void>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: Text('Carte $codeCarte'),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Blast ${blast.numero} - $libelle',
-                style: TextStyle(
-                  fontFamily: kSerif,
-                  fontSize: (13 * MiseEnPage.depuis(context).k).clamp(10.0, 13.0),
-                  color: AppColors.slate,
-                ),
-              ),
-              const SizedBox(height: 12),
-              Container(
-                decoration: BoxDecoration(
-                  border: Border.all(color: AppColors.border, width: 1.5),
-                ),
-                // La carte est un plan taille : on peut la pincer pour lire un
-                // detail, la vignette du bouton ne le permet pas.
-                  child: InteractiveViewer(
-                  maxScale: 6,
-                  child: SizedBox(
-                    width: largeur,
-                    height: hauteur,
-                    child: _ImagePlan(chemin: session.planCourant ?? blast.plan),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Fermer'),
-          ),
-        ],
+      barrierDismissible: true,
+      barrierLabel: 'Fermer la carte',
+      barrierColor: Colors.black87,
+      transitionDuration: const Duration(milliseconds: 180),
+      pageBuilder: (context, animation, secondaryAnimation) =>
+          _PleinEcranCarte(
+        codeCarte: codeCarte,
+        libelle: libelle,
+        blast: blast.numero,
+        chemin: chemin,
       ),
+      transitionBuilder: (context, animation, secondary, child) =>
+          FadeTransition(opacity: animation, child: child),
     );
   }
 
@@ -1060,50 +1105,279 @@ class _SpotterScreenState extends State<SpotterScreen> {
   }
 }
 
-/// Plan d'une carte, asset embarque ou fichier telecharge du serveur.
+/// Plan d'une carte : asset embarque, URL reseau (Drive) ou fichier local.
 ///
-/// Un blast venu du serveur pointe d'abord sur l'URL du JPG, puis sur le
-/// fichier local pose par le worker de synchro. Un chemin hors `assets/`
-/// est donc un fichier disque : on le lit par `Image.file`, sinon par
-/// `Image.asset` comme avant.
+/// Trois cas, dans l'ordre de priorite :
+/// - `http(s)://` : le plan n'a pas encore ete telecharge, on l'affiche
+///   directement depuis le reseau (`Image.network`) ;
+/// - `assets/...` : plan embarque dans l'application ;
+/// - tout le reste : chemin de fichier local pose par le worker de synchro.
 class _ImagePlan extends StatelessWidget {
   const _ImagePlan({required this.chemin, this.fit = BoxFit.contain});
 
   final String chemin;
   final BoxFit fit;
 
-  bool get _estFichier => !chemin.startsWith('assets/');
+  bool get _estReseau =>
+      chemin.startsWith('http://') || chemin.startsWith('https://');
+
+  bool get _estAsset => chemin.startsWith('assets/');
+
+  static Widget _erreur(BuildContext context) => const Center(
+        child: Padding(
+          padding: EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.map_outlined, size: 40, color: AppColors.slate),
+              SizedBox(height: 10),
+              Text(
+                'Plan non disponible pour ce RL',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: AppColors.slate, fontSize: 15),
+              ),
+              SizedBox(height: 6),
+              Text(
+                'Lancez Actualiser pour telecharger le plan de cette carte.',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 12, color: AppColors.greyText),
+              ),
+            ],
+          ),
+        ),
+      );
 
   @override
   Widget build(BuildContext context) {
-    if (_estFichier) {
-      return Image.file(
-        File(chemin),
+    // Aucun plan connu pour cette carte : etat vide explicite plutot qu'un
+    // `File('')` qui leve une exception au premier rendu.
+    if (chemin.isEmpty) return _erreur(context);
+    if (_estReseau) {
+      return Image.network(
+        chemin,
+        // Pas de `gaplessPlayback` ici : entre deux RL d'un meme blast, le
+        // plan doit etre REMPLACE, pas conserve. Avec gapless, Flutter
+        // laissait l'ancienne carte (RL 260) affichee pendant le chargement
+        // de la nouvelle, et le resultat restait bloque sur la premiere.
+        key: ValueKey<String>('reseau:$chemin'),
         fit: fit,
-        gaplessPlayback: true,
-        errorBuilder: (context, error, stack) => const Center(
-          child: Text(
-            'Plan introuvable',
-            style: TextStyle(color: AppColors.slate),
+        loadingBuilder: (context, child, progression) {
+          if (progression == null) return child;
+          final int recu = progression.cumulativeBytesLoaded;
+          final int? total = progression.expectedTotalBytes;
+          return Center(
+            child: SizedBox(
+              width: 40,
+              height: 40,
+              child: CircularProgressIndicator(
+                strokeWidth: 2,
+                value: total == null || total <= 0 ? null : recu / total,
+                color: AppColors.slate,
+              ),
+            ),
+          );
+        },
+        errorBuilder: (context, error, stack) => Center(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.broken_image_outlined,
+                    size: 32, color: AppColors.slate),
+                const SizedBox(height: 8),
+                const Text(
+                  'Plan introuvable',
+                  style: TextStyle(color: AppColors.slate),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Verifiez que le fichier est partage avec le lien',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: AppColors.greyText,
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       );
     }
-    return Image.asset(
-      chemin,
+    if (_estAsset) {
+      return Image.asset(
+        chemin,
+        key: ValueKey<String>('asset:$chemin'),
+        fit: fit,
+        errorBuilder: (context, error, stack) => _erreur(context),
+      );
+    }
+    return Image.file(
+      File(chemin),
+      // Cle sur le chemin : changer de RL change de fichier, donc de widget.
+      key: ValueKey<String>('fichier:$chemin'),
       fit: fit,
-      gaplessPlayback: true,
-      errorBuilder: (context, error, stack) => const Center(
-        child: Text(
-          'Plan introuvable',
-          style: TextStyle(color: AppColors.slate),
-        ),
-      ),
+      errorBuilder: (context, error, stack) => _erreur(context),
     );
   }
 }
 
-class _BlastOption extends StatelessWidget {
+      /// Plan en PLEIN ECRAN, zoomable.
+      ///
+      /// Ouvert par un tap sur le bouton `Afficher map`. Le plan occupe toute la
+      /// surface utile et se manipule aux gestes :
+      /// - **pinch** (deux doigts) : zoom libre entre 1x et 8x ;
+      /// - **double-tap** : bascule entre « ajuste a l'ecran » et « zoom x3 » ;
+      /// - **drag a un doigt** : deplacement quand l'image est zoomee.
+      ///
+      /// Un bandeau superieur discret rappelle le code de carte et le blast, avec
+      /// le bouton `Fermer`. Le fond noir fait ressortir le plan.
+      class _PleinEcranCarte extends StatefulWidget {
+        const _PleinEcranCarte({
+          required this.codeCarte,
+          required this.libelle,
+          required this.blast,
+          required this.chemin,
+        });
+
+        final String codeCarte;
+        final String libelle;
+        final String blast;
+        final String chemin;
+
+        @override
+        State<_PleinEcranCarte> createState() => _PleinEcranCarteState();
+      }
+
+      class _PleinEcranCarteState extends State<_PleinEcranCarte> {
+        /// Controleur de transformation : permet le double-tap zoom/dezoom.
+        final TransformationController _zoom = TransformationController();
+
+        static const double _zoomDoubleTap = 3.0;
+
+        @override
+        void dispose() {
+          _zoom.dispose();
+          super.dispose();
+        }
+
+        /// Double-tap : alterne entre vue ajustee (1x) et zoom [_zoomDoubleTap].
+        void _doubleTap() {
+          if (_zoom.value.getMaxScaleOnAxis() > 1.05) {
+            _zoom.value = Matrix4.identity();
+          } else {
+            _zoom.value = Matrix4.identity()..scaleByDouble(
+                _zoomDoubleTap, _zoomDoubleTap, _zoomDoubleTap, 1.0);
+          }
+        }
+
+        @override
+        Widget build(BuildContext context) {
+          final MiseEnPage mise = MiseEnPage.depuis(context);
+          final double k = mise.k;
+
+          return Scaffold(
+            backgroundColor: Colors.black,
+            body: SafeArea(
+              child: Column(
+                children: [
+                  // Bandeau superieur : identification + fermeture.
+                  Container(
+                    padding: EdgeInsets.symmetric(
+                      horizontal: (14 * k).clamp(10.0, 16.0),
+                      vertical: (8 * k).clamp(6.0, 10.0),
+                    ),
+                    color: Colors.black,
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                'Carte ${widget.codeCarte}',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontFamily: kSerif,
+                                  fontSize: (17 * k).clamp(13.0, 18.0),
+                                  fontWeight: FontWeight.w700,
+                                  color: Colors.white,
+                                ),
+                              ),
+                              if (widget.libelle.isNotEmpty)
+                                Text(
+                                  'Blast ${widget.blast} - ${widget.libelle}',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    fontSize: (12 * k).clamp(10.0, 12.0),
+                                    color: Colors.white70,
+                                  ),
+                                ),
+                              // Diagnostic TEMPORAIRE : montre la source
+                              // reellement chargee (ID Drive ou chemin local).
+                              // A retirer une fois le multi-RL valide.
+                              Text(
+                                'src: ${widget.chemin}',
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: (9 * k).clamp(8.0, 10.0),
+                                  color: Colors.amberAccent,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        IconButton(
+                          key: const ValueKey<String>('carte-reset-zoom'),
+                          onPressed: _doubleTap,
+                          tooltip: 'Zoom / ajuster',
+                          icon: const Icon(Icons.zoom_out_map,
+                              color: Colors.white, size: 26),
+                        ),
+                        IconButton(
+                          key: const ValueKey<String>('carte-fermer'),
+                          onPressed: () => Navigator.of(context).pop(),
+                          tooltip: 'Fermer',
+                          icon: const Icon(Icons.close,
+                              color: Colors.white, size: 28),
+                        ),
+                      ],
+                    ),
+                  ),
+                  // Plan : toute la place restante, zoom + double-tap.
+                  Expanded(
+                    child: GestureDetector(
+                      onDoubleTap: _doubleTap,
+                      child: InteractiveViewer(
+                        transformationController: _zoom,
+                        minScale: 1.0,
+                        maxScale: 8.0,
+                        // La carte est un plan taille : on peut la deplacer en
+                        // entier une fois zoomee.
+                        boundaryMargin: const EdgeInsets.all(double.infinity),
+                        child: SizedBox.expand(
+                          child: _ImagePlan(
+                            chemin: widget.chemin,
+                            fit: BoxFit.contain,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        }
+      }
+
+      class _BlastOption extends StatelessWidget {
   const _BlastOption({
     required this.numero,
     required this.blast,

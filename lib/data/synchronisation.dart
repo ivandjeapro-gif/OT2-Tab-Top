@@ -258,43 +258,84 @@ class Synchronisation extends ChangeNotifier {
       notifyListeners();
     }
 
-    // Plans manquants : un blast qui pointe encore sur une URL (http) n'a
-    // pas son JPG en local. Telecharge une fois, pose en fichier, et le
-    // chemin local remplace l'URL — les passes suivantes n'y reviennent pas.
+    // Plans manquants : on telecharge le plan de CHAQUE carte du blast (une
+    // par RL). Un blast a plusieurs RL (ex. 113 = flitch 260 + 262.5) a un
+    // plan different par RL ; ne telecharger que `serveur.planUrl` laisserait
+    // les autres RL sans image.
     for (final BlastServeur serveur in liste) {
       if (serveur.planUrl.isEmpty) continue;
       final Blast? blast = base.parNumero(serveur.numero);
-      if (blast == null || !blast.plan.startsWith('http')) continue;
-      final Uint8List? octets =
-          await transmetteur.telechargerPlan(serveur.planUrl);
-      final String? chemin = await _ecrirePlanLocal(serveur, octets);
-      if (chemin == null) continue;
-      base.poserPlanLocal(serveur.carte, chemin);
-      _dire('Plan telecharge - carte ${serveur.carte} du blast ${serveur.numero}');
-      notifyListeners();
+      if (blast == null) continue;
+
+      // Table carte -> URL : on part de l'URL globale, puis on ajoute les
+      // URL par carte quand le serveur les fournit.
+      final Map<String, String> urls = <String, String>{};
+      if (serveur.planUrl.isNotEmpty) {
+        urls[serveur.carte] = serveur.planUrl;
+      }
+      serveur.planUrlParCarte.forEach((String carte, String url) {
+        if (url.isEmpty) return;
+        urls[carte] = url;
+        // Redondance volontaire : la table memoire de la base est aussi
+        // alimentee ici, pour que `planPourCarte` connaisse l'URL de CE RL
+        // meme si `recevoirBlasts` a ete court-circuite (blast deja connu).
+        base.poserUrlPlan(carte, url);
+      });
+
+      for (final MapEntry<String, String> e in urls.entries) {
+        final String carte = e.key;
+        final String url = e.value;
+        // Deja telecharge pour cette carte : rien a refaire.
+        final String? dejaLocal = base.planDe(carte);
+        if (dejaLocal != null && dejaLocal.isNotEmpty) continue;
+
+        final Uint8List? octets = await transmetteur.telechargerPlan(url);
+        if (octets == null || octets.isEmpty) continue;
+        final String? chemin = await _ecrirePlanCarte(carte, octets);
+        if (chemin == null) continue;
+        base.poserPlanLocal(carte, chemin);
+        _dire('Plan telecharge - carte $carte du blast ${serveur.numero}');
+        notifyListeners();
+      }
     }
   }
 
-  /// Ecrit les octets d'un plan dans un fichier local du dossier documents.
+  /// Ecrit les octets du plan d'une carte dans un fichier local.
   ///
-  /// Le nom de fichier est stable (carte + extension) : une re-telecharge
-  /// ecrase le meme fichier au lieu d'accumuler des copies.
-  Future<String?> _ecrirePlanLocal(
-    BlastServeur serveur,
-    Uint8List? octets,
-  ) async {
-    if (octets == null || octets.isEmpty) return null;
+  /// Le nom de fichier est stable (code de carte) : une re-telecharge ecrase
+  /// le meme fichier au lieu d'accumuler des copies. L'extension suit le
+  /// type reel des octets (PNG ou GIF possible dans le dossier Drive).
+  Future<String?> _ecrirePlanCarte(String carte, Uint8List octets) async {
+    if (octets.isEmpty) return null;
     try {
       final Directory dossier = await getApplicationDocumentsDirectory();
+      final String ext = _extensionImage(octets);
       final String chemin =
-          '${dossier.path}${Platform.pathSeparator}plan_${serveur.carte}.jpg';
+          '${dossier.path}${Platform.pathSeparator}plan_$carte.$ext';
       final File fichier = File(chemin);
       await fichier.writeAsBytes(octets, flush: true);
       return chemin;
     } catch (e) {
-      base.journaliser('PLAN ${serveur.carte} ECHEC $e');
+      base.journaliser('PLAN $carte ECHEC $e');
       return null;
     }
+  }
+
+  /// Devine l'extension depuis les octets (signature du fichier).
+  static String _extensionImage(Uint8List octets) {
+    if (octets.length >= 4) {
+      // PNG : 89 50 4E 47
+      if (octets[0] == 0x89 && octets[1] == 0x50 &&
+          octets[2] == 0x4E && octets[3] == 0x47) {
+        return 'png';
+      }
+      // GIF : 47 49 46 38
+      if (octets[0] == 0x47 && octets[1] == 0x49 &&
+          octets[2] == 0x46 && octets[3] == 0x38) {
+        return 'gif';
+      }
+    }
+    return 'jpg';
   }
 
   /// Lit l'affectation choisie et validee par le serveur (destination,

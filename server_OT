@@ -10,7 +10,7 @@
  * 1. Creer un Google Spreadsheet ; les onglets sont initialises automatiquement.
  * 2. Coller CE FICHIER dans Extensions > Apps Script.
  * 3. Renseigner CONFIG (ID du Spreadsheet, dossier Drive, TOKEN).
- * 4. Renseigner les onglets `profils`, `equipements` et `dts`.
+ * 4. Renseigner les onglets `profils`, `identifiants`, `flotte` et `tab`.
  * 5. Deployer en Web App : Execute as Me, Who has access Anyone.
  * 6. Configurer sur les tablettes `api_base` (URL + /exec) et `api_token`.
  *
@@ -44,16 +44,16 @@
 
 const CONFIG = {
   /** ID du Spreadsheet (dans son URL : /d/ID/edit) */
-  SPREADSHEET_ID: 'METTRE_ID_DU_SPREADSHEET',
+  SPREADSHEET_ID: '1U1hU4uOAwAhWyFOD6LuLgHfbRAyTU1TxxjD_vnF0rks',
 
   /** Jeton partage avec les tablettes (meta.api_token cote client) */
-  TOKEN: 'METTRE_UN_JETON_LONG_ET_ALEATOIRE',
+  TOKEN: 'bcjp29afy3uso1mltw60vdnre5qgzk8xhi47',
 
   /** Version de protocole acceptee (X-Protocol-Version → verifie dans le corps) */
   VERSION_PROTOCOLE: '1.0',
 
   /** ID du dossier Drive contenant les plans des cartes (JPG) */
-  DOSSIER_PLANS_ID: 'METTRE_ID_DU_DOSSIER_PLANS',
+  DOSSIER_PLANS_ID: '1nOTs7uWhbtQb3XeZ9vhDRMFBB837KJ2B',
 
   /** Fichier GeoJSON des pistes du site (Trails.geojson), pour le parcours */
   FICHIER_PISTES_ID: 'METTRE_ID_DU_GEOJSON',
@@ -72,8 +72,20 @@ const CONFIG = {
     JOURNAL: 'journal',
     NOTIFICATIONS: 'notifications',
     PROFILS: 'profils',
+    // Trois onglets distincts, un par nature de donnee :
+    //  - `identifiants` : ce que l'utilisateur choisit au login (camion,
+    //    machine, ou nom du spotter) ;
+    //  - `flotte`       : les DT du site (famille + numero), pour le
+    //    formulaire « Nouvelle ligne » ;
+    //  - `equipements`  : le materiel (GNSS, capteurs...), reserve ;
+    //  - `tab`          : les tablettes / boites BLE (TAB3-01...).
+    IDENTIFIANTS: 'identifiants',
+    FLOTTE: 'flotte',
     EQUIPEMENTS: 'equipements',
-    DTS: 'dts',
+    TAB: 'tab',
+    // Nom historique de l'onglet des tablettes, avant renommage.
+    // Sert uniquement a la migration et a la lecture de repli.
+    TAB_LEGACY: 'dts',
   },
 };
 
@@ -110,8 +122,15 @@ const SCHEMAS = {
   journal: ['horodatage', 'message'],
   notifications: ['id', 'profil', 'message', 'horodatage'],
   profils: ['code', 'libelle', 'titre', 'role_cdc', 'icone', 'ordre', 'actif'],
-  equipements: ['profil', 'id', 'nom', 'actif'],
-  dts: ['type', 'id', 'actif'],
+  // Identifiants proposes au login (un par equipement/personne).
+  identifiants: ['profil', 'id', 'nom', 'actif'],
+  // Flotte de DT : `famille` = 1500 / 785 / ADT, `numero` = entier unique
+  // sur tout le parc, `actif` = booleen. Une ligne = un camion.
+  flotte: ['famille', 'numero', 'actif'],
+  // Materiel du site (GNSS, capteurs...) : reserve, rempli a la main.
+  equipements: ['id', 'type', 'nom', 'actif'],
+  // Tablettes / boites BLE : `role` = role CDC de l'appareil.
+  tab: ['role', 'id', 'actif'],
   // evenements : sans entete, colonnes imposees par l'ordre d'appendRow.
 };
 
@@ -131,6 +150,7 @@ const COLONNES_EVENEMENTS = [
  */
 function initialiser() {
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  migrerStructuration(ss);
   // evenements : jamais d'entete, mais une colonne vide tient lieu de tete
   // de fichier — on ne pose une ligne d'exemple QUE si la feuille est vide.
   if (!ss.getSheetByName(CONFIG.ONGLETS.EVENEMENTS)) {
@@ -591,7 +611,8 @@ function referentielsLire() {
         actif: p.actif === true || String(p.actif).toLowerCase() === 'true' || Number(p.actif) === 1 ? 1 : 0,
       }))
       .filter((p) => p.code && p.libelle && p.role_cdc);
-  const equipements = lireTable(CONFIG.ONGLETS.EQUIPEMENTS)
+  // Identifiants proposes au login (tablette/boite, camion, spotter...).
+  const equipements = lireTable(CONFIG.ONGLETS.IDENTIFIANTS)
       .map((e) => ({
         profil: String(e.profil || '').trim(),
         id: String(e.id || '').trim(),
@@ -599,10 +620,14 @@ function referentielsLire() {
         actif: e.actif === true || String(e.actif).toLowerCase() === 'true' || Number(e.actif) === 1 ? 1 : 0,
       }))
       .filter((e) => e.profil && e.id);
-  const dts = lireTable(CONFIG.ONGLETS.DTS)
+  // Flotte de DT : `type` porte la FAMILLE (1500/785/ADT) et `id` le NUMERO
+  // du camion. La cle JSON reste `dts` pour ne pas casser les tablettes
+  // deja deployees qui lisent ce nom : c'est un detail de contrat reseau,
+  // pas le nom de l'onglet cote Spreadsheet.
+  const dts = lireTable(CONFIG.ONGLETS.FLOTTE)
       .map((d) => ({
-        type: String(d.type || '').trim(),
-        id: String(d.id || '').trim(),
+        type: String(d.famille || '').trim(),
+        id: String(d.numero || '').trim(),
         actif: d.actif === true || String(d.actif).toLowerCase() === 'true' || Number(d.actif) === 1 ? 1 : 0,
       }))
       .filter((d) => d.type && d.id);
@@ -624,6 +649,8 @@ function referentielsLire() {
       profils.some((p) => p.actif && !equipementsActifs.has(p.code))) {
     return corps(false, 'referentiels absents ou incoherents');
   }
+  // La cle JSON reste `equipements` : les tablettes deja deployees lisent
+  // ce nom et n'ont pas a etre mises a jour en meme temps que le serveur.
   return corps(true, {
     referentiels_version: 1,
     profils: profils,
@@ -706,12 +733,15 @@ function blastsLire() {
       const cartesListe = declarees.slice();
       const code = cartesListe[0];
       const carte = cartes[code] || {};
-      // Blocs rattaches a leur RL : { carte, blocs: [...] }. Le client sait
+      // Blocs rattaches a leur RL : { carte, flocs: [...] }. Le client sait
       // ainsi exactement quels blocs appartiennent a quel RL.
       const blocsParCarte = cartesListe.map((c) => ({
         carte: c,
         flitch: (decoderCarte(c) || {}).flitch || '',
         blocs: (blocsParBlastCarte[numBlast + '||' + c] || []),
+        // URL du plan de CETTE carte (une par RL). Sans ce champ, le client
+        // ne peut afficher que le plan de la premiere carte du blast.
+        plan_url: urlPlanDrive(c),
       }));
       const totalBlocs = blocsParCarte.reduce(
         (t, e) => t + e.blocs.length, 0);
@@ -727,7 +757,9 @@ function blastsLire() {
         // Legacy : liste plate (tous les blocs, tous RL confondus).
         blocs: blocsParBlast[numBlast] || [],
         nombre_blocs: totalBlocs,
-        plan_url: baseUrl() + '?action=plan&carte=' + encodeURIComponent(code),
+        plan_url:
+          urlPlanDrive(code) ||
+          (baseUrl() + '?action=plan&carte=' + encodeURIComponent(code)),
       };
     }),
   });
@@ -749,38 +781,53 @@ function baseUrl() {
 // ============================================================
 
 /**
- * Livre les octets du plan depuis le dossier Drive.
+ * URL de telechargement direct d'un plan depuis Drive.
  *
- * Voie B — le code de carte EST le nom de fichier sans extension (nomenclature
- * du site : 232.5_OM_LWP2_235_230_106). Aucun prefixe, aucune extension
- * imposee : le fichier est retrouve par son nom de base, quelle que soit son
- * extension (.jpg, .jpeg, .png, .gif...).
+ * Apps Script ne sait PAS streamer un binaire via ContentService (addBlob
+ * n'existe pas sur TextOutput). On renvoie donc au client l'URL publique
+ * `drive.google.com/uc?export=download&id=<fileId>`, qu'il telecharge en
+ * HTTP direct — sans passer par la Web App.
  *
- * Le MIME est celui REELLEMENT declare par Drive, jamais force en JPEG :
- * annoncer image/jpeg sur des octets PNG ferait echouer l'affichage cote
- * tablette. Seul repli si Drive rend un type generique (octet-stream) : on
- * le deduit de l'extension.
+ * Rend '' si le fichier n'existe pas dans le dossier (le caller retombe
+ * alors sur l'URL Apps Script, qui signalera l'absence).
+ */
+function urlPlanDrive(carte) {
+  if (!carte) return '';
+  try {
+    const fichiers = DriveApp.getFolderById(CONFIG.DOSSIER_PLANS_ID).getFiles();
+    while (fichiers.hasNext()) {
+      const f = fichiers.next();
+      const nom = f.getName();
+      const point = nom.lastIndexOf('.');
+      const base = point > 0 ? nom.substring(0, point) : nom;
+      if (base !== carte) continue;
+      // Le fichier doit etre partage « Anyone with the link » pour que la
+      // tablette puisse le telecharger. Si l'acces est restreint, Drive
+      // renvoie une page HTML a la place de l'image.
+      return 'https://drive.google.com/uc?export=download&id=' + f.getId();
+    }
+  } catch (e) {
+    journal('PLAN URL ECHEC ' + carte + ' : ' + e);
+  }
+  return '';
+}
+
+// ============================================================
+//  GET /plan — fallback (le client utilise plan_url direct)
+// ============================================================
+
+/**
+ * Ancien endpoint de streaming binaire.
  *
- * Reponse binaire : c'est le seul cas ou la reponse n'est pas du JSON — le
- * client (telechargerPlan) ne lit que les octets.
+ * Concerve pour compatibilite mais NE fonctionne PAS : Apps Script
+ * n'expose pas `addBlob()` sur TextOutput. Le champ `plan_url` renvoye
+ * par `?action=blasts` pointe desormais DIRECTEMENT sur Drive ; ce
+ * endpoint n'est donc appele que si le fichier n'a pas ete trouve.
  */
 function planServir(carte) {
-  if (!carte) throw 'carte absente';
-  const fichiers = DriveApp.getFolderById(CONFIG.DOSSIER_PLANS_ID).getFiles();
-  let trouve = null;
-  while (fichiers.hasNext()) {
-    const f = fichiers.next();
-    const nom = f.getName();
-    const point = nom.lastIndexOf('.');
-    const base = point > 0 ? nom.substring(0, point) : nom;
-    if (base === carte) { trouve = f; break; }
-  }
-  if (!trouve) throw 'plan introuvable : ' + carte;
-
-  const mime = mimePlan(trouve.getName(), trouve.getMimeType());
-  const sortie = Utilities.newBlob(trouve.getBlob().getBytes(), mime);
-  throw new ReponseBinaire(
-    ContentService.createTextOutput('').addBlob(sortie).setMimeType(mime)
+  return corps(false,
+    'plan introuvable dans Drive : ' + carte +
+    ' (verifiez que le fichier est partage avec le lien)'
   );
 }
 
@@ -1161,10 +1208,10 @@ function ecrireTableOuLoge(nom, entete, lignes, colonnesTexte) {
 // ============================================================
 //
 //  Menu Run ▶ semerReferentielsTest. Remplit `profils`, `equipements`,
-//  `dts` et `positions` avec un jeu de donnees coherent, conforme aux
+//  `tab` et `positions` avec un jeu de donnees coherent, conforme aux
 //  regles de referentielsLire() :
 //   - chaque profil actif a au moins un equipement actif ;
-//   - chaque type de `dts` a au moins un DT actif ;
+//   - chaque famille de la flotte a au moins un camion actif ;
 //   - ids uniques, DEPOT present dans `positions`.
 //
 //  ATTENTION : ces quatre onglets sont reinitialises (sh.clear()). Ne pas
@@ -1177,6 +1224,10 @@ function semerReferentielsTest() {
 
 /** Coeur testable : rend un compte rendu texte. */
 function semerReferentiels() {
+  // Meme raison que `semerFlotteDT` : les onglets sont crees par
+  // `initialiser()` avant la premiere ecriture.
+  initialiser();
+
   const lignes = [];
 
   const profils = [
@@ -1195,7 +1246,7 @@ function semerReferentiels() {
     ['DT',        'DT-02',   'DT 02',          true],
   ];
 
-  const dts = [
+  const tab = [
     ['DT', 'TAB3-01', true],
   ];
 
@@ -1208,11 +1259,11 @@ function semerReferentiels() {
   ecrireTable(CONFIG.ONGLETS.PROFILS, SCHEMAS.profils, profils);
   lignes.push('profils : ' + profils.length + ' ligne(s).');
 
-  ecrireTable(CONFIG.ONGLETS.EQUIPEMENTS, SCHEMAS.equipements, equipements);
-  lignes.push('equipements : ' + equipements.length + ' ligne(s).');
+  ecrireTable(CONFIG.ONGLETS.IDENTIFIANTS, SCHEMAS.identifiants, equipements);
+  lignes.push('identifiants : ' + equipements.length + ' ligne(s).');
 
-  ecrireTable(CONFIG.ONGLETS.DTS, SCHEMAS.dts, dts);
-  lignes.push('dts : ' + dts.length + ' ligne(s).');
+  ecrireTable(CONFIG.ONGLETS.TAB, SCHEMAS.tab, tab);
+  lignes.push('tab : ' + tab.length + ' ligne(s).');
 
   ecrireTable(CONFIG.ONGLETS.POSITIONS, SCHEMAS.positions, positions);
   lignes.push('positions : ' + positions.length +
@@ -1220,4 +1271,289 @@ function semerReferentiels() {
 
   lignes.push('Referentiels de test semes. Verifiez via ?action=referentiels.');
   return lignes.join('\n');
+}
+
+
+// ============================================================
+//  PEUPLEMENT — flotte DT (familles + numeros non redondants)
+// ============================================================
+//
+//  Menu Run ▶ semerFlotteDTPoint.
+//
+//  Remplit l'onglet `flotte` avec les trois familles de dameuses du site :
+//  les 1500, les 785 et les ADT.
+//
+//  FORMAT DE L'ONGLET `flotte` :
+//      famille | numero | actif
+//
+//  `famille` est la FAMILLE (`1500`, `785`, `ADT`) et `numero` est le NUMERO
+//  du camion, une simple suite de chiffres (`1`, `2`, `3`...). Cote client,
+//  la famille s'affiche « DT 1500 » et le numero « DT 5 ».
+//
+//  LES NUMEROS NE SE REPETENT JAMAIS D'UNE FAMILLE A L'AUTRE : la
+//  numerotation est continue sur tout le parc. La 1500 prend 1..N1500,
+//  la 785 reprend a N1500+1, l'ADT reprend apres la 785. Un numero
+//  designe donc un camion unique, quelle que soit sa famille — c'est la
+//  regle exigee cote formulaire (le second menu ne doit jamais proposer
+//  deux fois le meme numero).
+//
+//  Choix des effectifs et des cabines : modifiez FLOTTE_DT ci-dessous.
+// ============================================================
+
+/**
+ * Composition de la flotte. L'ordre du tableau fixe l'ordre des familles
+ * dans les menus ET l'ordre de numerotation (numeros croissants, sans
+ * trou, toutes familles confondues).
+ *
+ * `libelle` : texte affiche (le client ajoute « DT » devant le `code`).
+ * `nombre`  : nombre de camions de cette famille.
+ */
+const FLOTTE_DT = [
+  { code: '1500', libelle: 'DT 1500', nombre: 8 },
+  { code: '785',  libelle: 'DT 785',  nombre: 6 },
+  { code: 'ADT',  libelle: 'ADT',     nombre: 4 },
+];
+
+/**
+ * Point d'entree manuel (menu Run de l'editeur Apps Script).
+ * Le compte rendu est ecrit dans le journal d'execution.
+ */
+function semerFlotteDTPoint() {
+  Logger.log(semerFlotteDT());
+}
+
+/**
+ * Coeur testable : ecrit l'onglet `flotte` et rend un compte rendu texte.
+ *
+ * Idempotent : deux executions produisent exactement le meme contenu
+ * (memes numeros, meme ordre). La numerotation est purement derivee de
+ * FLOTTE_DT, sans aleatoire ni compteur persistant.
+ *
+ * ATTENTION : `ecrireTable` fait `sh.clear()` — les lignes saisies a la
+ * main dans `flotte` sont remplacees. Cet onglet ne porte que la flotte.
+ */
+function semerFlotteDT() {
+  // `ecrireTable` exige que l'onglet existe : sur un classeur neuf,
+  // `flotte` n'est pas encore cree. `initialiser()` le cree (et applique
+  // son entete) avant toute ecriture — sans cela, un premier lancement
+  // echouerait sur « onglet manquant : flotte ».
+  initialiser();
+
+  const lignes = [];
+  const rangees = [];
+  let numero = 1;
+
+  for (const famille of FLOTTE_DT) {
+    const code = String(famille.code || '').trim();
+    const nombre = Number(famille.nombre) || 0;
+    if (!code || nombre < 1) {
+      lignes.push('IGNORE : famille invalide ' + JSON.stringify(famille));
+      continue;
+    }
+    // Chaque camion de la famille recoit le prochain numero libre du parc :
+    // la numerotation ne repart jamais a 1 d'une famille a l'autre.
+    for (let i = 0; i < nombre; i++) {
+      rangees.push([code, String(numero), true]);
+      numero++;
+    }
+    lignes.push(
+      famille.libelle + ' : ' + nombre + ' camion(s), numeros ' +
+      (numero - nombre) + ' a ' + (numero - 1)
+    );
+  }
+
+  if (!rangees.length) {
+    lignes.push('AUCUNE famille valide dans FLOTTE_DT : rien ecrit.');
+    return lignes.join('\n');
+  }
+
+  // `numero` en format Texte brut : sans cela Sheets transformerait "1" en
+  // nombre et l'affichage perdrait son alignement avec les autres codes.
+  ecrireTableOuLoge(
+    CONFIG.ONGLETS.FLOTTE, SCHEMAS.flotte, rangees, ['numero', 'famille']);
+
+  lignes.push('flotte : ' + rangees.length + ' ligne(s) ecrite(s).');
+  lignes.push(
+    'Numeros de 1 a ' + (numero - 1) + ', sans doublon entre familles.'
+  );
+  lignes.push('Verifiez via ?action=referentiels.');
+  return lignes.join('\n');
+}
+
+
+// ============================================================
+//  DIAGNOSTIC — ou sont reellement les donnees de la flotte ?
+// ============================================================
+//
+//  Menu Run ▶ diagnostiquerOnglets
+//
+//  A utiliser quand une ecriture semble « reussie » dans le journal mais
+//  que le contenu reste invisible a l'ecran. Le cas typique est un DOUBLON
+//  DE NOM D'ONGLET : Sheets n'interdit pas deux onglets nommes pareil dans
+//  des classeurs differents, et un onglet renomme `dts (1)` ne repond plus
+//  a `getSheetByName('dts')`.
+//
+//  La fonction affiche, pour CHAQUE onglet du classeur : son nom exact
+//  (entre chevrons, espaces visibles), son nombre de lignes et son
+//  nombre de colonnes. On voit ainsi immediatement qui porte les 19
+//  lignes et sous quel nom.
+// ============================================================
+
+function diagnostiquerOnglets() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const lignes = [];
+
+  lignes.push('Classeur : ' + ss.getName());
+  lignes.push('URL      : ' + ss.getUrl());
+  lignes.push('ID       : ' + ss.getId());
+  lignes.push('');
+  lignes.push('Onglets presents (' + ss.getSheets().length + ') :');
+
+  for (const sh of ss.getSheets()) {
+    const nom = sh.getName();
+    // Entre chevrons pour rendre visibles les espaces parasites :
+    // « dts » et « dts » (avec un espace final) sont deux onglets distincts.
+    lignes.push(
+      '  <' + nom + '>  lignes=' + sh.getLastRow() +
+      '  colonnes=' + sh.getLastColumn()
+    );
+  }
+
+  lignes.push('');
+  lignes.push('Onglet attendu pour la flotte : <' + CONFIG.ONGLETS.FLOTTE + '>');
+  const attendu = ss.getSheetByName(CONFIG.ONGLETS.FLOTTE);
+  if (!attendu) {
+    lignes.push('  ABSENT ! Les donnees sont donc dans un onglet homonyme.');
+  } else {
+    lignes.push(
+      '  lignes=' + attendu.getLastRow() +
+      ' colonnes=' + attendu.getLastColumn()
+    );
+    // Extrait des 5 premieres lignes pour confirmer le contenu reel.
+    const apercu = attendu.getLastRow() > 0
+      ? attendu.getRange(1, 1,
+          Math.min(5, attendu.getLastRow()),
+          Math.max(1, Math.min(3, attendu.getLastColumn()))).getValues()
+      : [];
+    lignes.push('  apercu :');
+    for (const r of apercu) {
+      lignes.push('    [' + r.map((v) => String(v)).join(' | ') + ']');
+    }
+  }
+
+  Logger.log(lignes.join('\n'));
+  return lignes.join('\n');
+}
+
+// ============================================================
+//  STRUCTURATION — separation flotte / tab / equipements
+// ============================================================
+//
+//  Ancien modele (confus) :
+//    `equipements` = identifiants de login ET flotte DT melanges
+//    `dts`         = flotte DT (18 lignes) ET tablettes BLE
+//
+//  Nouveau modele, un onglet par nature :
+//    `identifiants` : ce que l'utilisateur choisit au login
+//    `flotte`       : les DT du site (famille 1500/785/ADT + numero)
+//    `tab`          : les tablettes / boites BLE (TAB3-01...)
+//    `equipements`  : le materiel (GNSS, capteurs...), reserve
+//
+//  La migration est IDEMPOTENTE et ne detruit rien :
+//    1. `identifiants` absent mais `equipements` present
+//         -> `equipements` est copie en `identifiants`
+//    2. `flotte` absente mais `dts` present
+//         -> les lignes de `dts` sont converties en `flotte`
+//            (type|id -> famille|numero) ET `tab` est cree vide
+//    3. `tab` absent -> cree vide avec son entete
+//
+//  Aucun onglet source n'est supprime : on peut verifier, puis ranger
+//  a la main. Chaque etape journalise son resultat.
+//
+//  Lancee par `initialiser()` a chaque appel HTTP. Declenchement manuel :
+//  Run ▶ migrerStructurationManuel
+// ============================================================
+
+function migrerStructurationManuel() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  Logger.log(migrerStructuration(ss, true));
+}
+
+/**
+ * @param {Spreadsheet} ss classeur cible
+ * @param {boolean=} verbeux true pour rendre un compte rendu texte
+ * @return {string} compte rendu (vide si rien a faire et non verbeux)
+ */
+function migrerStructuration(ss, verbeux) {
+  const faits = [];
+
+  // --- 1. identifiants <- equipements -----------------------------------
+  const idents = ss.getSheetByName(CONFIG.ONGLETS.IDENTIFIANTS);
+  if (!idents) {
+    const ancienEq = ss.getSheetByName(CONFIG.ONGLETS.EQUIPEMENTS);
+    if (ancienEq) {
+      const valeurs = ancienEq.getLastRow() > 0
+        ? ancienEq.getDataRange().getValues()
+        : [];
+      const copie = ancienEq.copyTo(ss).setName(CONFIG.ONGLETS.IDENTIFIANTS);
+      copie.setFrozenRows(1);
+      faits.push('identifiants <- equipements (' +
+        Math.max(0, valeurs.length - 1) + ' ligne(s))');
+    }
+  }
+
+  // --- 2. flotte <- dts, puis tab vide ----------------------------------
+  const flotte = ss.getSheetByName(CONFIG.ONGLETS.FLOTTE);
+  if (!flotte) {
+    const ancienDts = ss.getSheetByName(CONFIG.ONGLETS.TAB_LEGACY);
+    if (ancienDts) {
+      const lignes = ancienDts.getLastRow() > 1
+        ? ancienDts.getDataRange().getValues().slice(1)
+        : [];
+      // Conversion du format historique : `type | id | actif`
+      //   type   -> la FAMILLE (ex. `1500`, `785`, `ADT`)
+      //   id     -> le NUMERO du camion (ex. `1`, `2`, ...)
+      // Une ligne dont le numero n'est pas un entier strictement positif
+      // est ignoree : elle ne representait pas un camion.
+      const rangees = [];
+      for (const l of lignes) {
+        const famille = String(l[0] || '').trim();
+        const numero = String(l[1] || '').trim();
+        if (!famille || !/^[0-9]+$/.test(numero)) continue;
+        rangees.push([famille, numero, true]);
+      }
+      ecrireTableOuLoge(
+        CONFIG.ONGLETS.FLOTTE, SCHEMAS.flotte, rangees,
+        ['numero', 'famille']);
+      faits.push('flotte <- dts (' + rangees.length + ' camion(s))');
+
+      // Les anciennes lignes de `dts` n'etaient PAS des tablettes (c'etait
+      // la flotte). `tab` demarre donc vide : il recevra les vraies
+      // tablettes a la main.
+      const tab = ss.getSheetByName(CONFIG.ONGLETS.TAB);
+      if (!tab) {
+        const t = ss.insertSheet(CONFIG.ONGLETS.TAB);
+        t.getRange(1, 1, 1, SCHEMAS.tab.length)
+          .setValues([SCHEMAS.tab]).setFontWeight('bold');
+        t.setFrozenRows(1);
+        faits.push('tab cree (vide)');
+      }
+    }
+  }
+
+  // --- 3. equipements reserve -------------------------------------------
+  // L'onglet `equipements` reste en place mais n'est plus lu pour le login.
+  // On ne le recree pas s'il a ete supprime : `initialiser()` s'en charge
+  // avec son nouveau schema (materiel).
+
+  if (faits.length) {
+    const rapport = 'STRUCTURATION : ' + faits.join(' | ');
+    journal(rapport);
+    if (verbeux) return rapport;
+    return '';
+  }
+  if (verbeux) {
+    return 'Rien a faire : <identifiants>, <flotte> et <tab> sont en place.';
+  }
+  return '';
 }
