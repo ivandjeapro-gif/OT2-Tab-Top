@@ -208,6 +208,20 @@ class BleGateway {
     await lien.envoyer(BleProtocole.encoder(BleProtocole.ack(eventId: eventId)));
   }
 
+  /// Pousse une enveloppe d'evenement a TOUS les clients authentifies.
+  ///
+  /// Pendant BLE de `WifiGateway.diffuserEvenement` : l'excavatrice relaie
+  /// vers le DT ce qu'elle a collecte (saisies spotter, positions).
+  Future<void> diffuserEvenement(Map<String, Object?> evenement) async {
+    for (final LienBle lien in _liens.values) {
+      try {
+        await lien.envoyer(BleProtocole.encoder(evenement));
+      } catch (_) {
+        // Lien parti : l'evenement reste en file, la passe suivante reprend.
+      }
+    }
+  }
+
   /// Diffuse une notification a TOUS les clients authentifies (le DT
   /// excavatrice relaie le canal serveur vers les spotters presents).
   Future<void> diffuserNotification(Map<String, Object?> notification) async {
@@ -296,6 +310,10 @@ class BleClient {
   /// Notification serveur recue sur le lien BLE (Boss -> DT -> spotter) :
   /// la couche au-dessus la stocke en base et l'affiche (bandeau rouge).
   void Function(Map<String, Object?> notification)? surNotification;
+
+  /// Evenement metier recu d'une autre tablette (relais de l'excavatrice) :
+  /// la couche au-dessus le stocke pour l'envoyer ensuite au serveur.
+  void Function(Map<String, Object?> evenement)? surEvenement;
 
   /// Demarre la decouverte et la connexion a l'excavatrice (emetteur).
   ///
@@ -399,6 +417,11 @@ class BleClient {
       fileAttente.removeWhere((e) => e['event_id'] == id);
       surAck?.call(id);
       _journal.ligne('BLE ACK recu pour $id');
+    } else if (m['type'] == BleProtocole.typeEvenement) {
+      // Relais recu (excavatrice -> DT) : la couche au-dessus le stocke puis
+      // l'acquitte, ce qui purge la file du relais.
+      surEvenement?.call(m);
+      _journal.ligne('BLE evenement recu ${m['event_type']}');
     } else if (m['type'] == BleProtocole.typeNotification) {
       // Boss -> serveur -> DT -> ici : notification recue par le lien local,
       // la couche au-dessus la stocke et l'affiche (bandeau rouge).

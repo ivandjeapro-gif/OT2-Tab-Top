@@ -166,6 +166,23 @@ class WifiGateway {
     }
   }
 
+  /// Pousse une enveloppe d'événement à TOUS les clients authentifiés.
+  ///
+  /// C'est le pendant serveur de [WifiClient.envoyer] : l'excavatrice relaie
+  /// vers le DT ce qu'elle a collecté (spotter, positions). Les clients
+  /// acquittent chacun comme d'habitude ; l'émetteur original, lui, a déjà
+  /// reçu son ACK au moment de la collecte, donc il ne le rejouera pas.
+  Future<void> diffuserEvenement(Map<String, Object?> evenement) async {
+    for (final LienWifi lien in _liens.values) {
+      try {
+        await lien.envoyer(WifiProtocole.encoder(evenement));
+      } catch (_) {
+        // Lien parti : l'événement reste en file, la passe suivante le
+        // reprendra pour les clients encore présents.
+      }
+    }
+  }
+
   /// Envoie un ACK à l'appareil source (idempotence CDC §17).
   Future<void> acquitter(String source, String eventId) async {
     final LienWifi? lien = _liens[source];
@@ -242,6 +259,12 @@ class WifiClient {
 
   /// Evenements acquittés par TAB 2 : la couche au-dessus purge la file.
   void Function(String eventId)? surAck;
+
+  /// Evenement metier recu d'une autre tablette (relais du DT ou de
+  /// l'excavatrice) : la couche au-dessus le stocke localement pour l'envoyer
+  /// ensuite au serveur. Sans ce canal, les donnees du spotter s'arreteraient
+  /// a la tablette relais.
+  void Function(Map<String, Object?> evenement)? surEvenement;
 
   /// Notification serveur recue sur le lien local (Boss -> DT -> spotter) :
   /// meme canal que la descente HTTP, mais instantane quand le DT est a
@@ -373,6 +396,11 @@ class WifiClient {
       fileAttente.removeWhere((e) => e['event_id'] == id);
       surAck?.call(id);
       _journal.ligne('Wi-Fi ACK recu pour $id');
+    } else if (m['type'] == WifiProtocole.typeEvenement) {
+      // Relais recu (excavatrice -> DT, ou DT -> spotter) : la couche
+      // au-dessus le stocke puis l'acquitte pour purger la file du relais.
+      surEvenement?.call(m);
+      _journal.ligne('Wi-Fi evenement recu ${m['event_type']}');
     } else if (m['type'] == WifiProtocole.typeNotification) {
       // Boss -> serveur -> DT -> ici : la notification arrive par le lien
       // local, la couche au-dessus la stocke et l'affiche (bandeau rouge).

@@ -1178,7 +1178,48 @@ feederPerle(mesure);
     // pilote par demarrerSurveillanceReseau/etatWifiDevice; il ne doit pas
     // servir de garde d'authentification.
     notifyListeners();
+    // Les couches locales ne partent qu'une fois le role connu : c'est ici,
+    // et seulement ici, que l'excavatrice ouvre son advertising BLE et son
+    // serveur TCP, et que le spotter et le DT deviennent clients. Sans cet
+    // appel, les trois tablettes restaient chacun dans leur coin.
+    unawaited(demarrerCouchesLocales());
     return true;
+  }
+
+  /// Demarre les deux couches P2P du role courant (BLE + Wi-Fi).
+  ///
+  /// Sans transport injecte, chaque couche demande ses permissions et prend
+  /// son transport reel. En cas d'echec d'une couche, l'autre continue : le
+  /// Wi-Fi et le BLE sont deux chemins redondants vers la meme excavatrice,
+  /// pas une chaine obligatoire.
+  Future<void> demarrerCouchesLocales({
+    TransportBle? transportBle,
+    TransportWifi? transportWifi,
+  }) async {
+    if (!_actif) return;
+    try {
+      await demarrerBle(transport: transportBle);
+    } catch (e) {
+      _direSiActif('BLE indisponible : $e');
+    }
+    try {
+      await demarrerWifi(transport: transportWifi);
+    } catch (e) {
+      _direSiActif('Wi-Fi indisponible : $e');
+    }
+    if (_actif) notifyListeners();
+  }
+
+  /// Faux des que [dispose] a ete appele.
+  ///
+  /// Les couches locales demarrent apres [connect] : la tache peut encore
+  /// tourner quand l'ecran est detruit (tests, retour arriere). Sans ce
+  /// garde-fou, le `push` final touchait un ChangeNotifier detruit.
+  bool _actif = true;
+
+  /// [push] sans risque si la session a ete detruite entre-temps.
+  void _direSiActif(String message) {
+    if (_actif) push(message);
   }
 
   void disconnect() {
@@ -1187,14 +1228,18 @@ feederPerle(mesure);
     _timerRssi?.cancel();
     _timerRssi = null;
     // Les couches de collecte s'eteignent : plus rien ne circule vers le DT.
-    _gatewayBle?.arreter();
+    unawaited(_gatewayBle?.arreter());
     _gatewayBle = null;
-    _clientBle?.arreter();
+    unawaited(_clientBle?.arreter());
     _clientBle = null;
-    _gatewayWifi?.arreter();
+    unawaited(_gatewayWifi?.arreter());
     _gatewayWifi = null;
-    _clientWifi?.arreter();
+    unawaited(_clientWifi?.arreter());
     _clientWifi = null;
+    _relaisTimer?.cancel();
+    _relaisTimer = null;
+    _timerWifi?.cancel();
+    _timerWifi = null;
     bleActif = false;
     wifiActif = false;
     // Aucune file n'est plus en vol : les fleches d'echange retombent.
@@ -1244,6 +1289,25 @@ feederPerle(mesure);
   /// de 10 m.
   static const String idGateway = 'EXC-001';
 
+  /// Identite reseau de cette tablette : l'identifiant enrole, rien d'autre.
+  ///
+  /// C'est la meme valeur des deux cotes du lien : elle sert de cle
+  /// `equipements.id`, de `source_device` dans les evenements, de cle
+  /// d'authentification dans `idsAutorises`, et de nom de session perle.
+  /// L'unicite des identifiants sur tout le parc (CDC models.dart) garantit
+  /// qu'aucune collision de role n'est possible : un `1501` est toujours un
+  /// DT, jamais un spotter.
+  ///
+  /// Le suffixe `deviceName` n'est pas repris : le nom est un libelle
+  /// d'affichage, il peut changer sans casser l'authentification.
+  String get identiteReseau {
+    if (deviceId.isNotEmpty) return deviceId;
+    // Aucune session ouverte (tests, ecran de demarrage) : un repli stable
+    // et unique evite d'annoncer la meme identite a deux tablettes.
+    final Profil? p = profile;
+    return p == null ? 'TAB-000' : 'TAB-${p.code.toUpperCase()}-000';
+  }
+
   /// Rayon de connexion du profil excavator, en metres (§2.3).
   ///
   /// Un DT n'est accepte ("pret et charge") que s'il est entre dans ce rayon
@@ -1289,7 +1353,11 @@ feederPerle(mesure);
       // DT : client BLE, il se connecte a l'excavatrice presente dans son rayon.
       final BleClient client = BleClient(
         transport: transport,
-        sourceDevice: deviceId.isEmpty ? 'TAB2-DT' : 'TAB2-$deviceId',
+        // Identite reseau = identifiant enrole (`equipements.id`), celui que
+        // `idsAutorises` contient cote excavatrice. Un prefixe de role
+        // (`TAB2-...`) ferait echouer le handshake en "non enrole" et
+        // ouvrirait la session perle sous un nom inconnu du serveur.
+        sourceDevice: identiteReseau,
         role: BaseLocale.roleTab2,
       );
       client.surAck = (String eventId) {
@@ -1329,6 +1397,9 @@ feederPerle(mesure);
         base.evenementRecu(evenement);
         push('BLE evenement recu de $source : ${evenement['event_type']}');
         gateway.acquitter(source, '${evenement['event_id']}');
+        // Le DT present dans le rayon recoit aussitot ce que le spotter vient
+        // de saisir : la boucle periodique couvre le cas du DT absent.
+        unawaited(_relayerVersDt());
         notifyListeners();
       };
       // Notifiation recue d'un client : relayee a tous les autres clients
@@ -1364,6 +1435,10 @@ feederPerle(mesure);
   void dispose() {
     _timerRssi?.cancel();
     _timerRssi = null;
+    _timerWifi?.cancel();
+    _timerWifi = null;
+    _relaisTimer?.cancel();
+    _relaisTimer = null;
     _gatewayBle?.arreter();
     _clientBle?.arreter();
     _gatewayWifi?.arreter();
@@ -1378,6 +1453,9 @@ feederPerle(mesure);
     alerter.fermer();
     _syncTimer?.cancel();
     synchro.arreter();
+    // Les couches demarrent en arriere-plan : ce drapeau empeche leur fin
+    // d'atteindre un notifier detruit.
+    _actif = false;
     super.dispose();
   }
 
@@ -1396,6 +1474,9 @@ feederPerle(mesure);
   /// État Wi-Fi exposé aux écrans (même pattern que [bleActif]).
   bool wifiActif = false;
   int clientsWifiConnectes = 0;
+
+  /// Rafraichit [clientsWifiConnectes] (boucle de 5 s, cote excavatrice).
+  Timer? _timerWifi;
 
   /// Port applicatif ORE TRACKING (les deux côtés le connaissent, CDC §7).
   static const int portWifi = 45210;
@@ -1453,10 +1534,11 @@ feederPerle(mesure);
       } else {
         push('Wi-Fi Direct : excavatrice hors portee - donnees en file locale');
       }
-      final String prefixe = estTab1 ? 'TAB1' : 'TAB2';
       final WifiClient client = WifiClient(
         transport: transport,
-        sourceDevice: deviceId.isEmpty ? '$prefixe-001' : '$prefixe-$deviceId',
+        // Meme regle que le BLE : le `source_device` doit etre l'identifiant
+        // enrole, pas un prefixe de role (voir `identiteReseau`).
+        sourceDevice: identiteReseau,
         role: estTab1 ? BaseLocale.roleTab1 : BaseLocale.roleTab2,
       );
       client.surAck = (String eventId) {
@@ -1470,6 +1552,13 @@ feederPerle(mesure);
       // base + bandeau), le curseur est le meme donc aucun double affichage.
       client.surNotification = (Map<String, Object?> notif) {
         unawaited(recevoirNotificationLocale(notif));
+      };
+      // Meme canal de relais que le BLE : le DT recoit par TCP ce que
+      // l'excavatrice lui pousse.
+      client.surEvenement = (Map<String, Object?> evenement) {
+        _recevoirRelais(evenement, acquitter: (String id) async {
+          await client.envoyer(_enveloppeAck(id, client.sourceDevice));
+        });
       };
       // Reconnexion automatique (REQ-008) : à chaque retour de lien, la file
       // repart automatiquement (l'envoi initial est dans _retransmettreFileWifi).
@@ -1501,6 +1590,7 @@ feederPerle(mesure);
         base.evenementRecu(evenement);
         push('Wi-Fi données reçues de $source : ${evenement['event_type']}');
         gateway.acquitter(source, '${evenement['event_id']}');
+        unawaited(_relayerVersDt());
         notifyListeners();
       };
       // Notification recue d'un client Wi-Fi (Boss -> serveur -> DT ->
@@ -1511,9 +1601,112 @@ feederPerle(mesure);
       _gatewayWifi = gateway;
       await gateway.demarrer();
       wifiActif = true;
+      // Compteurs du point d'acces : sans cette boucle, le nombre de clients
+      // Wi-Fi restait a zero et le badge ne reflechissait jamais la realite.
+      _timerWifi?.cancel();
+      _timerWifi = Timer.periodic(const Duration(seconds: 5), (_) {
+        clientsWifiConnectes = gateway.clientsConnectes.length;
+        notifyListeners();
+      });
+      _demarrerRelaisVersDt();
       push('Wi-Fi point d\'accès actif - ${gateway.idsAutorises.length} appareil(s) autorisé(s)');
     }
     notifyListeners();
+  }
+
+  /// Traite un evenement recu par relais (excavatrice -> cette tablette).
+  ///
+  /// On le stocke dans la file locale (`PENDING`), puis on acquitte : c'est
+  /// cet ACK qui autorise le relais a le retirer de sa propre file. Stocker
+  /// avant d'acquitter garantit qu'une coupure entre les deux ne perd rien.
+  void _recevoirRelais(
+    Map<String, Object?> evenement, {
+    required Future<void> Function(String eventId) acquitter,
+  }) {
+    final Map<String, Object?>? normalise = base.evenementRecu(evenement);
+    if (normalise == null) return;
+    push(
+      'Donnees recues de ${normalise['source_device']} : '
+      '${normalise['event_type']}',
+    );
+    notifyListeners();
+    unawaited(acquitter('${normalise['event_id']}'));
+  }
+
+  /// Enveloppe d'acquittement pour un evenement recu par relais.
+  Map<String, Object?> _enveloppeAck(String eventId, String _) =>
+      <String, Object?>{
+        'type': 'ACK',
+        'event_id': eventId,
+      };
+
+  // ----------------------------------------------------- relais excavatrice -> DT
+
+  /// Boucle de vidage de la file locale vers le DT.
+  ///
+  /// L'excavatrice collecte les saisies du spotter et les positionnements du
+  /// DT, mais c'est le DT qui a la 4G : c'est donc lui qui doit porter les
+  /// evenements jusqu'au serveur. Tant qu'il est absent, la file reste en
+  /// `PENDING` et rien n'est perdu (REQ-012) : la boucle reprend des son
+  /// retour, sans intervention.
+  Timer? _relaisTimer;
+
+  /// Cadence de la boucle : assez courte pour que le DT parte avec les
+  /// donnees fraiches, assez longue pour ne pas saturer le lien radio.
+  static const Duration cadenceRelais = Duration(seconds: 10);
+
+  /// Vrai pendant qu'une passe de relais est en vol : sans ce verrou, le
+  /// timer et le relais immediat pourraient envoyer deux fois le meme lot.
+  bool _relaisEnCours = false;
+
+  void _demarrerRelaisVersDt() {
+    _relaisTimer?.cancel();
+    _relaisTimer = Timer.periodic(cadenceRelais, (_) => _relayerVersDt());
+    unawaited(_relayerVersDt());
+  }
+
+  /// Pousse la file `PENDING` vers le ou les DT connectes.
+  ///
+  /// Un evenement n'est retire de la file que lorsque le DT l'a **acquitte**
+  /// (retrait dans `surAck`), jamais au simple depart sur le fil : une
+  /// coupure en cours de route le laisse donc en attente.
+  Future<void> _relayerVersDt() async {
+    if (_relaisEnCours) return;
+    final BleGateway? gatewayBle = _gatewayBle;
+    final WifiGateway? gatewayWifi = _gatewayWifi;
+    final bool dtBle = gatewayBle != null && gatewayBle.clientsConnectes.isNotEmpty;
+    final bool dtWifi = gatewayWifi != null && gatewayWifi.clientsConnectes.isNotEmpty;
+    if (!dtBle && !dtWifi) return;
+
+    _relaisEnCours = true;
+    try {
+      final List<Map<String, Object?>> file = await base.evenementsPourRelais();
+      if (file.isEmpty) return;
+      int partis = 0;
+      if (dtWifi) {
+        // Wi-Fi d'abord : le TCP accepte les lots et acquitte par lien.
+        for (final Map<String, Object?> evenement in file) {
+          if (evenement['event_id'] == null) continue;
+          await gatewayWifi.diffuserEvenement(evenement);
+          partis++;
+        }
+      } else if (dtBle) {
+        for (final Map<String, Object?> evenement in file) {
+          if (evenement['event_id'] == null) continue;
+          await gatewayBle.diffuserEvenement(evenement);
+          partis++;
+        }
+      }
+      if (partis > 0) {
+        push('Relais vers le DT - $partis evenement(s) transmis');
+        notifyListeners();
+      }
+    } catch (e) {
+      // Lien coupe pendant le lot : la file reste intacte, la boucle reprendra.
+      push('Relais vers le DT interrompu : $e');
+    } finally {
+      _relaisEnCours = false;
+    }
   }
 
   /// Vrai pendant une transmission effective vers le DT (REQ-007) : la

@@ -787,6 +787,7 @@ class BaseLocale {
         );
   }
 
+
   Future<int?> _idDuBloc(
     Database db,
     String blast,
@@ -1335,19 +1336,126 @@ class BaseLocale {
 
   // --------------------------------------------------------------- ecritures
 
-  /// Evenement BLE recu d'un TAB 3, stocké par TAB 2 (CDC §10/§11/§17).
+  /// Evenement recu d'une autre tablette (BLE ou Wi-Fi), stocke par
+  /// l'excavatrice ou par le DT (CDC §10/§11/§17).
   ///
-  /// Idempotence locale (REQ-015) : un event_id déjà connu n'est pas
-  /// re-stocké — le remettrait deux fois dans la file de synchro.
-  void evenementRecu(Map<String, Object?> evenement) {
+  /// L'enveloppe recue est **reecrite, pas emballee** : le serveur recoit le
+  /// `event_type` d'origine (`LINE_ADD`, `BLAST_SEND`...) et le
+  /// `source_device` reel du spotter, avec le `gateway_id` de la tablette qui
+  /// relaie (CDC SERVEUR §3.1). C'est ce que le serveur attend pour router
+  /// l'evenement vers le bon onglet.
+  ///
+  /// Idempotence locale (REQ-015) : un event_id deja connu n'est pas
+  /// re-stocke — le remettrait deux fois dans la file de synchro.
+  ///
+  /// Renvoie l'enveloppe relisible (`event_id`, `event_type`, `payload`
+  /// decodee) pour la pousser vers le DT, ou null pour un doublon.
+  Map<String, Object?>? evenementRecu(Map<String, Object?> evenement) {
     final String eventId = '${evenement['event_id'] ?? ''}';
     if (eventId.isEmpty || _eventIdsConnus.contains(eventId)) {
       _journalBle.insert(0, 'DUPLICAT ignoré: $eventId');
-      return;
+      return null;
     }
     _eventIdsConnus.add(eventId);
-    _evenement('BLE_RELAY', evenement);
-    _journalBle.insert(0, 'BLE_RELAY $eventId de ${evenement['source_device']}');
+
+    // Payload : objet JSON direct, ou chaine JSON quand l'enveloppe vient
+    // d'une colonne `evenements` deja encodee.
+    String payload;
+    final Object? brut = evenement['payload'];
+    if (brut is String) {
+      payload = brut;
+    } else if (brut is Map) {
+      payload = jsonEncode(brut);
+    } else {
+      payload = '{}';
+    }
+
+    final String type = '${evenement['event_type'] ?? ''}';
+    final String source = '${evenement['source_device'] ?? ''}';
+    final String horodatage = '${evenement['timestamp'] ?? ''}';
+    _enAttente++;
+    final String horodatageFinal = horodatage.isEmpty
+        ? DateTime.now().toUtc().toIso8601String()
+        : horodatage;
+    final String typeFinal = type.isEmpty ? 'RELAY' : type;
+    _ecrire(
+      (Database db) => db.insert(
+        'evenements',
+        <String, Object?>{
+          'event_id': eventId,
+          // La passerelle qui relaie est CETTE tablette : c'est le sens de
+          // la colonne (CDC SERVEUR §3.1).
+          'gateway_id': _appareil.isEmpty
+              ? '${evenement['gateway_id'] ?? ''}'
+              : _appareil,
+          'source_device': source.isEmpty
+              ? '${evenement['gateway_id'] ?? ''}'
+              : source,
+          'event_type': typeFinal,
+          'timestamp': horodatageFinal,
+          'payload': payload,
+          'rssi': evenement['rssi'],
+          'etat': 'PENDING',
+          'tentatives': 0,
+        },
+      ),
+    );
+    _journalBle.insert(
+      0,
+      'RELAY $eventId ($typeFinal) de ${source.isEmpty ? 'inconnu' : source}',
+    );
+    // Enveloppe normalisee : c'est exactement ce que le DT recevra, avec son
+    // en-tete `type` pour le protocole de lien (BLE ou Wi-Fi). Le marqueur
+    // doit etre celui du protocole (`EVENEMENT`), sinon le pair ignore le
+    // message comme un type inconnu.
+    return <String, Object?>{
+      'type': 'EVENEMENT',
+      'event_id': eventId,
+      'gateway_id': _appareil,
+      'source_device': source.isEmpty ? _appareil : source,
+      'event_type': typeFinal,
+      'timestamp': horodatageFinal,
+      'payload': brut is Map ? brut : jsonDecode(payload),
+    };
+  }
+
+  /// Lignes de la file encore en attente, au format enveloppe du lien.
+  ///
+  /// Sert au relais de l'excavatrice : ce qu'elle a collecte n'est pas
+  /// destine au serveur (elle n'a pas la 4G), mais au DT qui passera dans
+  /// son rayon. On reprend la forme du protocole de lien, pas celle de la
+  /// colonne SQL.
+  Future<List<Map<String, Object?>>> evenementsPourRelais({int limite = 40}) async {
+    final Database? db = _db;
+    if (db == null) return const <Map<String, Object?>>[];
+    final List<Map<String, Object?>> lignes = await db.query(
+      'evenements',
+      where: "etat = 'PENDING'",
+      orderBy: 'rowid',
+      limit: limite,
+    );
+    return <Map<String, Object?>>[
+      for (final Map<String, Object?> ligne in lignes)
+        <String, Object?>{
+          'type': 'EVENT',
+          'event_id': ligne['event_id'],
+          'gateway_id': ligne['gateway_id'],
+          'source_device': ligne['source_device'],
+          'event_type': ligne['event_type'],
+          'timestamp': ligne['timestamp'],
+          'payload': _decoderPayload(ligne['payload']),
+        },
+    ];
+  }
+
+  /// Decode la colonne `payload` (chaine JSON) sans jamais lever.
+  static Object? _decoderPayload(Object? brut) {
+    if (brut is! String || brut.isEmpty) return const <String, Object?>{};
+    try {
+      return jsonDecode(brut);
+    } catch (_) {
+      return const <String, Object?>{};
+    }
   }
 
   /// Event IDs déjà traités localement (idempotence CDC §17).
