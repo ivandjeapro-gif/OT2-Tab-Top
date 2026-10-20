@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../communication/position/service_position.dart';
 import '../data/base_locale.dart';
 import '../data/transmetteur.dart';
 import '../state/session.dart';
@@ -43,6 +44,14 @@ class _ParametresScreenState extends State<ParametresScreen> {
   late final TextEditingController _filtre;
 
   String _envoiMode = BaseLocale.envoiModeBlast;
+
+  /// Source de position choisie (« GPS tablette » par defaut).
+  ChoixGps _choixGps = ChoixGps.tablette;
+
+  /// Reseau de l'excavatrice (saisie unique, memorisee par Android).
+  late TextEditingController _ssidReseau;
+  late TextEditingController _mdpReseau;
+
   String? _erreur;
 
   /// Resultat du dernier test de sante du serveur (affiche sous le bouton).
@@ -78,18 +87,45 @@ class _ParametresScreenState extends State<ParametresScreen> {
     _intervalle = TextEditingController(text: base.meta('intervalle_gps_s') ?? '5');
     _filtre = TextEditingController(text: base.meta('filtre_distance_gps_m') ?? '5');
     _envoiMode = base.envoiMode;
+    _choixGps = ChoixGps.depuisMeta(base.meta('source_gps'));
+    _ssidReseau = TextEditingController(text: base.meta('reseau_ssid') ?? '');
+    _mdpReseau =
+        TextEditingController(text: base.meta('reseau_mot_de_passe') ?? '');
   }
 
   @override
   void dispose() {
     _apiBase.dispose();
     _apiToken.dispose();
+    _ssidReseau.dispose();
+    _mdpReseau.dispose();
     _seuilEntree.dispose();
     _seuilSortie.dispose();
     _delai.dispose();
     _intervalle.dispose();
     _filtre.dispose();
     super.dispose();
+  }
+
+  /// Rejoint le point d'acces de l'excavatrice avec les identifiants saisis.
+  ///
+  /// Les valeurs sont ecrites dans `meta` **avant** la tentative : une
+  /// tablette redemarree apres un echec doit retrouver ce que l'operateur
+  /// avait saisi, sans le retaper.
+  Future<void> _rejoindre() async {
+    final String ssid = _ssidReseau.text.trim();
+    final String mdp = _mdpReseau.text.trim();
+    if (ssid.isEmpty) {
+      setState(() => _erreur = 'SSID vide : relevez-le sur l\'ecran '
+          'de l\'excavatrice.');
+      return;
+    }
+    await session.base.majMeta('reseau_ssid', ssid);
+    await session.base.majMeta('reseau_mot_de_passe', mdp);
+    setState(() => _erreur = null);
+    await session.rejoindreReseauExcavatrice();
+    if (!mounted) return;
+    Navigator.of(context).pop();
   }
 
   /// Valide puis ecrit chaque cle. Une valeur incoherente est refusee avant
@@ -136,6 +172,14 @@ class _ParametresScreenState extends State<ParametresScreen> {
     // de sa premiere carte.
     base.poserBaseServeur(apiBase);
     await base.majMeta('envoi_mode', _envoiMode);
+    // Source GPS : relue a la prochaine ouverture de la base. Un changement
+    // de source ne s'applique donc qu'au redemarrage, ce que le message de
+    // confirmation rappelle a l'operateur.
+    await base.majMeta('source_gps', _choixGps.code);
+    // Reseau cible : memorise ici pour que le client puisse le rejoindre a
+    // chaque demarrage sans ressaisie.
+    await base.majMeta('reseau_ssid', _ssidReseau.text.trim());
+    await base.majMeta('reseau_mot_de_passe', _mdpReseau.text.trim());
     await base.majMeta('seuil_entree_m', entree.toString());
     await base.majMeta('seuil_sortie_m', sortie.toString());
     await base.majMeta('delai_confirmation_s', delai.toString());
@@ -300,7 +344,118 @@ class _ParametresScreenState extends State<ParametresScreen> {
                       ],
                     ),
                     SizedBox(height: 16 * k),
+                    // Reseau de l'excavatrice : saisis UNE SEULE FOIS.
+                    //
+                    // Le point d'acces vient de `LocalOnlyHotspot` : Android
+                    // lui attribue un SSID et un mot de passe aleatoires, que
+                    // l'excavatrice affiche sous son nom. Android memorise
+                    // ensuite la connexion — cette saisie ne revient donc
+                    // qu'apres un redemarrage de l'excavatrice.
+                    _Section(k: k, titre: 'Reseau de l\'excavatrice'),
+                    // Deux champs cote a cote : la page defile, mais chaque
+                    // ligne gagnee repousse le bouton Enregistrer hors de
+                    // portee sur les petits ecrans.
+                    Row(
+                      children: [
+                        Expanded(
+                          flex: 3,
+                          child: _Champ(
+                            k: k,
+                            indice: 'SSID',
+                            valeur: _ssidReseau,
+                          ),
+                        ),
+                        SizedBox(width: 10 * k),
+                        Expanded(
+                          flex: 2,
+                          child: _Champ(
+                            k: k,
+                            indice: 'Mot de passe',
+                            valeur: _mdpReseau,
+                            masque: true,
+                          ),
+                        ),
+                        SizedBox(width: 8 * k),
+                        // Connexion immediate : raccourci d'enregistrement
+                        // (les deux champs partent dans `meta` avant l'appel).
+                        SizedBox(
+                          height: (42 * k).clamp(34.0, 42.0),
+                          child: Material(
+                            color: AppColors.slate,
+                            child: InkWell(
+                              onTap: _rejoindre,
+                              child: Padding(
+                                padding: EdgeInsets.symmetric(horizontal: 12 * k),
+                                child: Center(
+                                  child: Text(
+                                    'Rejoindre',
+                                    style: TextStyle(
+                                      fontSize: (14 * k).clamp(11.0, 14.0),
+                                      fontWeight: FontWeight.w700,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    SizedBox(height: 16 * k),
                     _Section(k: k, titre: 'GPS'),
+                    // Source de position. Le choix est explicite et volontaire :
+                    // sans lui, l'application ne peut pas distinguer un releve
+                    // de chantier d'une position deduite du Wi-Fi par la
+                    // tablette, et afficherait les deux de la meme facon.
+                    //
+                    // « GPS tablette » sert au depannage : la position est
+                    // affichee mais marquee NON exploitable (badge orange,
+                    // coordonnees remplacees par des tirets).
+                    // « GPS GNSS » declare le recepteur externe : c'est le seul
+                    // mode qui rend les coordonnees exploitables.
+                    RadioGroup<ChoixGps>(
+                      groupValue: _choixGps,
+                      onChanged: (ChoixGps? v) =>
+                          setState(() => _choixGps = v ?? _choixGps),
+                      child: Column(
+                        children: [
+                          for (final ChoixGps c in ChoixGps.values)
+                            RadioListTile<ChoixGps>(
+                              dense: true,
+                              contentPadding: EdgeInsets.zero,
+                              value: c,
+                              activeColor: AppColors.slate,
+                              // GNSS desactive tant que la lecture du port
+                              // serie n'existe pas : le choisir ferait lire
+                              // le capteur interne de la tablette en le
+                              // presentant comme un releve de chantier. On
+                              // prefere une case inerte a une fausse
+                              // certification.
+                              enabled: !c.estIndisponible,
+                              title: Text(
+                                c.libelle,
+                                style: TextStyle(
+                                  fontFamily: kSerif,
+                                  fontSize: (15 * k).clamp(12.0, 15.0),
+                                  color: AppColors.ink,
+                                ),
+                              ),
+                              subtitle: Text(
+                                c.estIndisponible
+                                    ? 'Recepteur externe - indisponible tant que '
+                                        'la lecture USB-C n\'est pas implementee'
+                                    : 'Capteur de la tablette - non exploitable',
+                                style: TextStyle(
+                                  fontSize: (12 * k).clamp(10.0, 12.0),
+                                  color: const Color(0xFF6E7278),
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                    SizedBox(height: 8 * k),
                     Row(
                       children: [
                         Expanded(

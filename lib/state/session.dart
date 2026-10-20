@@ -157,7 +157,14 @@ class Session extends ChangeNotifier {
                 eastingDepart: _demoEastingDepart,
                 northingDepart: _demoNorthingDepart,
               )
-            : null,
+            // Hors demo : la source vient du reglage `source_gps`.
+            // « GPS GNSS » = recepteur externe, seul releve exploitable ;
+            // « GPS tablette » = capteur du device, affiche mais signale.
+            : GpsReel(
+                intervalle: _intervalleGps,
+                filtreDistance: _filtreGps,
+                source: choixGps.source,
+              ),
         intervalle: _intervalleGps,
         filtreDistance: _filtreGps,
       );
@@ -377,8 +384,32 @@ class Session extends ChangeNotifier {
   EtatCouche get etatGps {
     final ServicePosition? service = servicePosition;
     if (service == null || !service.actif) return EtatCouche.arret;
-    return service.derniere == null ? EtatCouche.recherche : EtatCouche.connecte;
+    final PositionTerrain? derniere = service.derniere;
+    if (derniere == null) return EtatCouche.recherche;
+    // Vert UNIQUEMENT sur un recepteur externe. Le capteur interne de la
+    // tablette rend une position qui peut venir du Wi-Fi ou du reseau
+    // mobile : la presenter en vert laisserait croire a un releve de site
+    // fiable, alors qu'elle peut etre fausse de plusieurs centaines de
+    // metres. Orange = mesure presente mais non exploitable.
+    return derniere.exploitable ? EtatCouche.connecte : EtatCouche.recherche;
   }
+
+  /// Source de position choisie dans les parametres (`meta.source_gps`).
+  ChoixGps get choixGps => ChoixGps.depuisMeta(base.meta('source_gps'));
+
+  /// Libelle de la source de position, pour l'ecran DT.
+  ///
+  /// « GNSS externe » = releve de terrain ; « interne » = capteur de la
+  /// tablette, a ne pas utiliser pour un point de tir ; « aucun » = service
+  /// arrete ou sans mesure.
+  String get libelleSourcePosition {
+    final PositionTerrain? derniere = servicePosition?.derniere;
+    if (derniere == null) return 'aucun';
+    return derniere.exploitable ? 'GNSS externe' : 'interne';
+  }
+
+  /// Vrai si la derniere position vient d'un recepteur externe.
+  bool get positionFiable => servicePosition?.derniere?.exploitable ?? false;
 
   // ------------------------------------------------------ etats simules (demo)
   // En mode DEMONSTRATION, les quatre badges de la barre du DT suivent des
@@ -1551,6 +1582,10 @@ feederPerle(mesure);
       ssidExcavatrice = reseau?.ssid ?? '';
       motDePasseExcavatrice = reseau?.motDePasse ?? '';
       pointAccesActif = reseau?.ok == true;
+      // Adresse du point d'acces : c'est elle que les clients joignent en
+      // TCP (port 45210). Lue sur l'interface, pas devinee : Android la
+      // place sur un sous-reseau different a chaque appareil.
+      adressePointAcces = reseau?.adresse ?? '';
       if (reseau?.ok == true) {
         push(
           reseau!.type == 'hotspot'
@@ -1647,6 +1682,28 @@ feederPerle(mesure);
       gateway.surNotification = (Map<String, Object?> notif) {
         unawaited(recevoirNotificationLocale(notif));
       };
+      // Presence detectee par le point d'acces : meme traitement que le BLE.
+      // Seul un DT ouvre une session perle ; un spotter est seulement
+      // journalise (il ne porte pas de moyenne de position).
+      gateway.surConnexion = (String source, String role) {
+        clientsWifiConnectes = gateway.clientsConnectes.length;
+        if (BaseLocale.estTab2(role)) {
+          ouvrirSessionPerle(source);
+        } else {
+          push('$source connecte au point d\'acces');
+        }
+        notifyListeners();
+      };
+      gateway.surDeconnexion = (String source) {
+        clientsWifiConnectes = gateway.clientsConnectes.length;
+        // Fin de la session perle seulement si c'est le DT qui partait.
+        if (_sessionPerle != null && dtConnecte == source) {
+          fermerSessionPerle();
+        } else {
+          push('$source deconnecte du point d\'acces');
+        }
+        notifyListeners();
+      };
       _gatewayWifi = gateway;
       await gateway.demarrer();
       wifiActif = true;
@@ -1707,29 +1764,32 @@ feederPerle(mesure);
   /// Le transport Wi-Fi du client est deja en place : on lui donne seulement
   /// l'adresse a joindre, puisqu'Android a choisi un SSID aleatoire que l'on
   /// ne peut pas reconnaitre a son nom.
-  Future<void> _rejoindreReseauAnnonce(
-    BleClient? client,
-    Map<String, Object?> m,
-  ) async {
-    final String adresse = '${m['adresse'] ?? ''}';
-    ssidExcavatrice = '${m['ssid'] ?? ''}';
-    adressePointAcces = adresse;
-    final WifiClient? wifi = _clientWifi;
-    if (wifi == null) {
-      push('Provision recue : SSID $ssidExcavatrice - Wi-Fi pas encore demarre');
+  /// Rejoint le point d'acces de l'excavatrice avec les identifiants saisis
+  /// dans les parametres (`reseau_ssid`, `reseau_mot_de_passe`).
+  ///
+  /// Appelee par l'operateur (bouton) ou au demarrage quand les deux cles
+  /// existent. C'est la voie qui reste quand le BLE du modele n'emet pas :
+  /// une saisie **unique**, puis Android memorise le reseau.
+  Future<bool> rejoindreReseauExcavatrice() async {
+    final String ssid = base.meta('reseau_ssid') ?? '';
+    final String mdp = base.meta('reseau_mot_de_passe') ?? '';
+    if (ssid.isEmpty) {
+      push('Aucun reseau enregistre : renseignez SSID et mot de passe dans '
+          'les parametres');
       notifyListeners();
-      return;
+      return false;
     }
-    final bool ok = await wifi.connecter(adresseImposee: adresse);
+    final bool ok = await WifiDirect.rejoindreReseau(ssid, mdp);
     if (ok) {
+      adressePointAcces = await WifiDirect.adresseLocale() ?? '';
       await _retransmettreFileWifi();
-      // Confirme a l'excavatrice : elle peut cesser de renvoyer la provision.
-      unawaited(client?.confirmerProvision() ?? Future<void>.value());
-      push('Reseau de l\'excavatrice rejoint ($ssidExcavatrice)');
+      await _retransmettreFileBle();
+      push('Reseau de l\'excavatrice rejoint ($ssid)');
     } else {
-      push('Provision recue mais reseau injoignable ($adresse)');
+      push('Reseau $ssid injoignable : verifiez le SSID et le mot de passe');
     }
     notifyListeners();
+    return ok;
   }
 
   /// Enveloppe d'acquittement pour un evenement recu par relais.

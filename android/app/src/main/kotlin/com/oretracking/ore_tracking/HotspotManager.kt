@@ -77,21 +77,21 @@ class HotspotManager(private val context: Context) {
     fun demarrer(
         nomGroupe: String,
         @Suppress("UNUSED_PARAMETER") motDePasse: String = MOT_DE_PASSE_DEFAUT,
-        onResultat: (Boolean, String?, String?, String?) -> Unit,
+        onResultat: (Boolean, String?, String?, String?, String?) -> Unit,
     ) {
         val w = wifi
         if (w == null) {
-            onResultat(false, "Wi-Fi indisponible sur cet appareil", null, null)
+            onResultat(false, "Wi-Fi indisponible sur cet appareil", null, null, null)
             return
         }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            onResultat(false, "Android 8 requis pour un point d'acces local", null, null)
+            onResultat(false, "Android 8 requis pour un point d'acces local", null, null, null)
             return
         }
         // Second appel pendant l'ouverture : Android refuse deux reservations
         // et rend dans ce cas un code generique. On repond l'etat courant.
         if (!demarrageEnCours.compareAndSet(false, true)) {
-            onResultat(false, "demarrage deja en cours", null, null)
+            onResultat(false, "demarrage deja en cours", null, null, null)
             return
         }
         // Une reservation deja ouverte est reutilisee : c'est le cas courant
@@ -99,7 +99,9 @@ class HotspotManager(private val context: Context) {
         val ouverte = reservation
         if (ouverte != null) {
             demarrageEnCours.set(false)
-            onResultat(true, null, ssidActuel, motDePasseActuel)
+            onResultat(
+                true, null, ssidActuel, motDePasseActuel, adresseHotspot(),
+            )
             return
         }
 
@@ -119,19 +121,22 @@ class HotspotManager(private val context: Context) {
             onResultat(
                 false,
                 "permission manquante : accordez l'acces a proximite et activez la localisation",
-                null, null,
+                null, null, null,
             )
         } catch (e: Exception) {
             demarrageEnCours.set(false)
             // Certains OEM levent IllegalStateException quand la radio est
             // occupee : la couche au-dessus retentera.
-            onResultat(false, "impossible de demarrer le point d'acces : ${e.message}", null, null)
+            onResultat(
+                false, "impossible de demarrer le point d'acces : ${e.message}",
+                null, null, null,
+            )
         }
     }
 
     /** Callback commun aux deux voies (fixe et aleatoire). */
     private fun callbackReservation(
-        onResultat: (Boolean, String?, String?, String?) -> Unit,
+        onResultat: (Boolean, String?, String?, String?, String?) -> Unit,
     ): WifiManager.LocalOnlyHotspotCallback {
         return object : WifiManager.LocalOnlyHotspotCallback() {
                 override fun onStarted(res: WifiManager.LocalOnlyHotspotReservation) {
@@ -151,7 +156,10 @@ class HotspotManager(private val context: Context) {
                     demarrageEnCours.set(false)
                     Log.i(TAG, "Hotspot demarre : SSID=$ssidActuel")
                     poster {
-                        onResultat(true, null, ssidActuel, motDePasseActuel)
+                        onResultat(
+                            true, null, ssidActuel, motDePasseActuel,
+                            adresseHotspot(),
+                        )
                     }
                 }
 
@@ -173,7 +181,7 @@ class HotspotManager(private val context: Context) {
                     }
                     Log.w(TAG, "Hotspot refuse : $motif")
                     poster {
-                        onResultat(false, motif, null, null)
+                        onResultat(false, motif, null, null, null)
                     }
                 }
             }

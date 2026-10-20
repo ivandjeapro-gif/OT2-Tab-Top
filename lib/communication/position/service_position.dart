@@ -28,6 +28,8 @@ class PositionTerrain {
     required this.elevation,
     this.horodatage,
     this.wgs84,
+    this.source = SourcePosition.interne,
+    this.precisionM,
   });
 
   final int easting;
@@ -37,6 +39,73 @@ class PositionTerrain {
 
   /// Position WGS84 source, pour la carte de suivi (§21).
   final ({double lat, double lng})? wgs84;
+
+  /// D'ou vient cette mesure. Une tablette SANS recepteur externe produit
+  /// quand meme une position : celle du capteur interne, qui peut etre
+  /// deduite du Wi-Fi ou du reseau mobile (donc fausse de plusieurs
+  /// centaines de metres). L'ecran ne doit jamais la presenter comme un
+  /// releve de terrain fiable.
+  final SourcePosition source;
+
+  /// Precision annoncee par le fournisseur, en metres (null si inconnue).
+  final double? precisionM;
+
+  /// Vrai si la mesure est assez fiable pour un releve de terrain.
+  bool get exploitable => source == SourcePosition.externe;
+}
+
+/// Origine d'une mesure de position.
+enum SourcePosition {
+  /// Recepteur GNSS externe (USB-C, Bluetooth) : seul garant d'une position
+  /// miniere. C'est la source attendue sur le terrain.
+  externe,
+
+  /// Capteur de la tablette : peut etre une position reseau, imprecise.
+  interne;
+}
+
+/// Source de position choisie dans les parametres (`meta.source_gps`).
+///
+/// Le technicien dit **explicitement** de quel materiel il dispose. Sans ce
+/// choix, l'application ne peut pas savoir si une position vient d'un
+/// recepteur de chantier ou du capteur de la tablette — et presente donc des
+/// coordonnees non fiables comme un releve de site.
+enum ChoixGps {
+  /// Capteur de la tablette (par defaut) : depannage, jamais un releve.
+  tablette('tablette', 'GPS tablette'),
+
+  /// Recepteur GNSS externe : seule source exploitable en production.
+  gnss('gnss', 'GPS GNSS');
+
+  const ChoixGps(this.code, this.libelle);
+
+  /// Valeur ecrite dans `meta.source_gps`.
+  final String code;
+
+  /// Texte affiche dans les parametres.
+  final String libelle;
+
+  /// Lit le choix depuis `meta`, avec repli sur la tablette.
+  static ChoixGps depuisMeta(String? valeur) {
+    final String v = (valeur ?? '').trim().toLowerCase();
+    for (final ChoixGps c in ChoixGps.values) {
+      if (c.code == v) return c;
+    }
+    return ChoixGps.tablette;
+  }
+
+  /// Position attendue de cette source.
+  SourcePosition get source =>
+      this == ChoixGps.gnss ? SourcePosition.externe : SourcePosition.interne;
+
+  /// Vrai tant que ce choix ne peut pas tenir sa promesse.
+  ///
+  /// « GPS GNSS » suppose de lire le port serie du recepteur USB-C, ce que
+  /// l'application ne fait pas encore (`geolocator` ne lit que les capteurs
+  /// internes). L'activer aujourd'hui ferait afficher les coordonnees de la
+  /// tablette comme un releve de chantier : on le laisse visible mais inerte
+  /// le temps que la lecture existe.
+  bool get estIndisponible => this == ChoixGps.gnss;
 }
 
 /// Fournisseur reel : le GPS du device (Android, ou capteur de localisation
@@ -56,7 +125,13 @@ class GpsReel implements FournisseurPosition {
   GpsReel({
     this.intervalle = const Duration(seconds: 5),
     this.filtreDistance = 5,
+    this.source = SourcePosition.interne,
   });
+
+  /// Origine annoncee des mesures. `interne` tant que le recepteur externe
+  /// n'est pas branche : c'est le cas par defaut, et il ne doit jamais etre
+  /// presente comme un releve fiable sur l'ecran DT.
+  final SourcePosition source;
 
   /// Cadence d'echantillonnage : le GPS rafraichit plus vite que besoin,
   /// la file d'evenements n'a pas a enfler pour rien.
@@ -137,12 +212,19 @@ class GpsReel implements FournisseurPosition {
   }
 
   /// Conversion WGS84 -> UTM (position terrain) d'une mesure geolocator.
+  ///
+  /// La source est `interne` par defaut : `geolocator` lit le capteur du
+  /// device, qui peut rendre une position deduite du Wi-Fi ou du reseau
+  /// mobile. Un recepteur externe devra marquer ses mesures `externe` pour
+  /// qu'elles soient presentees comme un releve de terrain.
   PositionTerrain _convertir(geo.Position p) => PositionTerrain(
         easting: Utm.depuisWgs84(p.latitude, p.longitude).$1,
         northing: Utm.depuisWgs84(p.latitude, p.longitude).$2,
         elevation: p.altitude.round(),
         horodatage: p.timestamp,
         wgs84: (lat: p.latitude, lng: p.longitude),
+        source: source,
+        precisionM: p.accuracy,
       );
 }
 

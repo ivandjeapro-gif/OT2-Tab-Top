@@ -122,6 +122,10 @@ class WifiGateway {
     await lien.envoyer(
         WifiProtocole.encoder(WifiProtocole.handshakeOk(gatewayId: idGateway)));
     _journal.ligne('Wi-Fi $id connecte (role $role)');
+    // Meme signal que le BLE : sans lui, un client arrive par le point
+    // d'acces n'ouvrait jamais sa session perle et l'ecran continuait
+    // d'afficher « Aucun DT dans le rayon » alors qu'un DT etait branche.
+    surConnexion?.call(id, role);
   }
 
   void _traiterMessage(String id, Uint8List octets) {
@@ -152,6 +156,15 @@ class WifiGateway {
   /// Notification serveur recue sur ce lien (Boss -> DT -> spotter) : le
   /// client la relaie a la couche au-dessus, qui la stocke et l'affiche.
   void Function(Map<String, Object?> notification)? surNotification;
+
+  /// Pair authentifie sur le point d'acces (source, role CDC).
+  ///
+  /// Pendant Wi-Fi de `BleGateway.surConnexion` : la session s'en sert pour
+  /// ouvrir la session perle du DT et afficher qui est present.
+  void Function(String source, String role)? surConnexion;
+
+  /// Pair deconnecte : la couche au-dessus ferme la session perle.
+  void Function(String source)? surDeconnexion;
 
   /// Diffuse une notification a TOUS les clients authentifies (le DT relaie
   /// le canal serveur vers les spotters presents dans son rayon).
@@ -204,6 +217,7 @@ class WifiGateway {
     _subs.remove(id)?.cancel();
     _liens.remove(id);
     _journal.ligne('Wi-Fi $id deconnecte');
+    surDeconnexion?.call(id);
   }
 
   Future<void> arreter() async {

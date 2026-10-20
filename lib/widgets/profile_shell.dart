@@ -8,14 +8,24 @@ import '../widgets/app_header.dart';
 import '../widgets/notification_ticker.dart';
 import '../widgets/status_badges.dart';
 import '../widgets/supervision_reseau.dart';
+import '../widgets/voyants_entete.dart';
 
 /// Gabarit commun des trois ecrans profils :
 /// bandeau logo + contenu + bandeau de notifications.
 class ProfileShell extends StatelessWidget {
-  const ProfileShell({super.key, required this.session, required this.body});
+  const ProfileShell({
+    super.key,
+    required this.session,
+    required this.body,
+    this.voyants,
+  });
 
   final Session session;
   final Widget body;
+
+  /// Voyants poses dans le bandeau du haut, a gauche du logo.
+  /// Null = profil sans voyants.
+  final ProfilVoyants? voyants;
 
   Future<void> _confirmerSortie(BuildContext context) async {
     final bool? quitter = await showDialog<bool>(
@@ -62,7 +72,12 @@ class ProfileShell extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            AppHeader(onExit: () => _confirmerSortie(context)),
+            AppHeader(
+              onExit: () => _confirmerSortie(context),
+              voyants: voyants == null
+                  ? null
+                  : VoyantsEntete(session: session, profil: voyants!),
+            ),
             Expanded(child: body),
             Row(
               children: [

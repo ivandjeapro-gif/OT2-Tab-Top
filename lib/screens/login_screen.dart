@@ -159,12 +159,19 @@ class _LoginScreenState extends State<LoginScreen> {
     // remplir les listes de connexion juste apres avoir saisi api_base /
     // api_token dans Parametres, sans redemarrer l'application.
     // Le deuxieme bouton est colle au bord via le meme decalage.
+    // Les deux boutons se replient sur deux lignes quand la largeur manque.
+    //
+    // Le `Transform.translate` qui les colle au bord decalait la ligne de
+    // 28 px vers la droite : sur un ecran etroit (telephone), cette ligne
+    // depassait son parent de 30 px et Flutter la signalait comme rognee.
+    // Un `Wrap` laisse les boutons passer a la ligne au lieu de deborder.
     final Widget boutons = Align(
       alignment: Alignment.centerRight,
       child: Transform.translate(
         offset: Offset(decalageDroitBoutonParametres, 0),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
+        child: Wrap(
+          alignment: WrapAlignment.end,
+          crossAxisAlignment: WrapCrossAlignment.center,
           children: [
             TextButton.icon(
               key: const ValueKey<String>('bouton-actualiser'),
@@ -358,10 +365,19 @@ class _LoginBody extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      mainAxisAlignment: MainAxisAlignment.center,
-      mainAxisSize: MainAxisSize.min,
-      children: [
+    // Le contenu defile au lieu de deborder.
+    //
+    // Sur un telephone (Tecno, portrait etroit), logo + titre + deux blocs +
+    // bouton depassent la hauteur disponible : sans defilement, Flutter
+    // signalait « RenderFlex overflowed by 134 pixels » et coupait le bas de
+    // l'ecran. Le `Center` garde le centrage quand tout tient, et le
+    // `SingleChildScrollView` prend le relais quand ce n'est plus le cas.
+    return Center(
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
+          children: [
         Padding(
           padding: const EdgeInsets.only(bottom: 8),
           child: boutonParametres,
@@ -405,7 +421,9 @@ class _LoginBody extends StatelessWidget {
                   hauteurUtile: hauteurUtile,
                 ),
         ),
-      ],
+          ],
+        ),
+      ),
     );
   }
 }

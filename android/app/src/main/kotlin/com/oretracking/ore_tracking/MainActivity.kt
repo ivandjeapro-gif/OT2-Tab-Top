@@ -34,12 +34,14 @@ class MainActivity : FlutterActivity() {
 
     private var wifiDirect: WifiDirectManager? = null
     private var hotspot: HotspotManager? = null
+    private var wifiClient: WifiClientManager? = null
     private var pendingResult: MethodChannel.Result? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         wifiDirect = WifiDirectManager(applicationContext)
         hotspot = HotspotManager(applicationContext)
+        wifiClient = WifiClientManager(applicationContext)
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, canal)
             .setMethodCallHandler { appel, resultat ->
@@ -70,7 +72,7 @@ class MainActivity : FlutterActivity() {
                             h.demarrer(
                                 nom,
                                 mdp ?: HotspotManager.MOT_DE_PASSE_DEFAUT,
-                            ) { ok, erreur, ssid, mdpReseau ->
+                            ) { ok, erreur, ssid, mdpReseau, adresse ->
                                 runOnUiThread {
                                     resultat.success(
                                         mapOf(
@@ -80,6 +82,7 @@ class MainActivity : FlutterActivity() {
                                             // Le mot de passe REEL du reseau, pas celui
                                             // demande : en repli, Android en genere un autre.
                                             "motDePasse" to (mdpReseau ?: mdp),
+                                            "adresse" to adresse,
                                             "type" to "hotspot",
                                         )
                                     )
@@ -144,6 +147,40 @@ class MainActivity : FlutterActivity() {
                             resultat.success(mapOf("ok" to ok, "erreur" to erreur))
                         }
                     }
+                    // --- role client : rejoindre le point d'acces annonce ---
+                    "rejoindre_reseau" -> {
+                        val ssid = appel.argument<String>("ssid") ?: ""
+                        val mdp = appel.argument<String>("motDePasse") ?: ""
+                        val c = wifiClient
+                        if (c == null) {
+                            resultat.success(
+                                mapOf("ok" to false, "erreur" to "client Wi-Fi absent")
+                            )
+                            return@setMethodCallHandler
+                        }
+                        c.connecter(ssid, mdp) { ok, erreur ->
+                            runOnUiThread {
+                                if (ok) {
+                                    // Le systeme memorise le reseau : les fois
+                                    // suivantes se font sans nouvelle saisie.
+                                    c.memoriser(ssid, mdp)
+                                }
+                                resultat.success(
+                                    mapOf(
+                                        "ok" to ok,
+                                        "erreur" to erreur,
+                                        "adresseLocale" to c.adresseLocale(),
+                                    )
+                                )
+                            }
+                        }
+                    }
+                    "adresse_locale" -> resultat.success(
+                        mapOf(
+                            "ok" to true,
+                            "adresseLocal" to wifiClient?.adresseLocale(),
+                        )
+                    )
                     "etat" -> {
                         val etatHotspot = hotspot?.etat() ?: emptyMap()
                         resultat.success(

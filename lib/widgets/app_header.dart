@@ -4,11 +4,20 @@ import '../theme/app_theme.dart';
 import '../theme/responsive.dart';
 
 /// Bandeau gris du haut : logo Lafigue + filet + logo ORE Tracking.
+///
+/// Il peut porter les voyants d'etat des couches de communication, places a
+/// gauche du logo. Les mettre ici plutot que dans le corps de chaque ecran a
+/// deux avantages : les trois profils les montrent au meme endroit, et ils ne
+/// prennent aucune hauteur utile au contenu metier (carte du DT, tableau du
+/// spotter).
 class AppHeader extends StatelessWidget {
-  const AppHeader({super.key, this.onExit});
+  const AppHeader({super.key, this.onExit, this.voyants});
 
   /// Action de deconnexion / sortie du profil vers l'accueil.
   final VoidCallback? onExit;
+
+  /// Voyants affiches a gauche du logo (4G, BLE, Wi-Fi...). Null = aucun.
+  final Widget? voyants;
 
   @override
   Widget build(BuildContext context) {
@@ -47,7 +56,15 @@ class AppHeader extends StatelessWidget {
               ],
             ),
           ),
-          // 2. Bouton Exit cale tout a droite de l'ecran.
+          // 2. Voyants a gauche, alignes verticalement sur le bandeau.
+          if (voyants != null)
+            Positioned(
+              left: 18 * k,
+              top: 0,
+              bottom: 0,
+              child: Center(child: voyants),
+            ),
+          // 3. Bouton Exit cale tout a droite de l'ecran.
           if (onExit != null)
             Positioned(
               right: 18 * k,

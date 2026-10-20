@@ -4,6 +4,7 @@ import '../state/session.dart';
 import '../theme/app_theme.dart';
 import '../theme/responsive.dart';
 import '../widgets/profile_shell.dart';
+import '../widgets/voyants_entete.dart';
 import '../widgets/carte_suivi.dart';
 import '../widgets/status_badges.dart';
 
@@ -17,6 +18,7 @@ class DtScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     return ProfileShell(
       session: session,
+      voyants: ProfilVoyants.dt,
       body: ListenableBuilder(
         listenable: session,
         builder: (context, _) {
@@ -53,8 +55,11 @@ class DtScreen extends StatelessWidget {
                       child: IntrinsicHeight(
                         child: Column(
                           children: [
+                            // Les voyants sont passes au bandeau du haut
+                            // (`ProfileShell.voyants`) ; cette barre ne garde
+                            // que le nom de l'equipement.
                             _TopBar(session: session),
-                            SizedBox(height: 16 * mise.k),
+                            SizedBox(height: 12 * mise.k),
                             Expanded(
                               // Sous 760 px de large, deux colonnes cote a cote
                               // laissent une carte illisible : la carte passe
@@ -192,6 +197,8 @@ class _Valeurs extends StatelessWidget {
         Expanded(
           flex: 20,
           child: _ValueTable(
+            // Le bandeau porte la source de position : un chiffre affiche
+            // plus bas ne vaut que si la ligne du haut dit « GNSS externe ».
             headers: const ['Destination', 'Dumping Area'],
             values: [
               session.destination.isEmpty
@@ -204,7 +211,28 @@ class _Valeurs extends StatelessWidget {
             valueSize: 45,
           ),
         ),
-        SizedBox(height: 18 * k),
+        SizedBox(height: 8 * k),
+        // Source de la position, juste au-dessus des coordonnees.
+        // Une tablette sans recepteur externe mesure quand meme quelque
+        // chose : ce libelle evite de prendre ce quelque chose pour un
+        // releve de site.
+        Text(
+          session.positionFiable
+              ? 'Source : GNSS externe'
+              : 'Source : ${session.libelleSourcePosition}'
+                  ' - releve non exploitable',
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+            fontFamily: kSerif,
+            fontSize: (12 * k).clamp(9.0, 12.0),
+            fontWeight: FontWeight.w700,
+            color: session.positionFiable
+                ? AppColors.green
+                : AppColors.orange,
+          ),
+        ),
+        SizedBox(height: 10 * k),
         Expanded(
           flex: 20,
           child: _ValueTable(
@@ -213,13 +241,17 @@ class _Valeurs extends StatelessWidget {
               'Northing',
               'Elevation',
             ],
-            // Valeurs GNSS reelles ou « — » tant qu'aucune mesure n'est
-            // arrivee : un tiret honnete (acquisition en cours, GPS absent
-            // ou permission refusee) plutot que des coordonnees de demarrage
-            // en dur qui feraient croire a une position. Sous Chrome, le
-            // service ne produit une mesure que si l'ordinateur bouge de
-            // 5 m (filtre distance) : immobile, il reste sur « — ».
-            values: session.derniereMesure == null
+            // Valeurs GNSS reelles ou « — ». Un tiret est HONNETE : il vaut
+            // mieux dire « je ne sais pas » qu'afficher une coordonnee
+            // fausse. Trois cas donnent le tiret :
+            //  - aucune mesure (acquisition en cours, service arrete) ;
+            //  - mesure issue du capteur INTERNE de la tablette, qui peut
+            //    etre deduite du Wi-Fi ou du reseau mobile et se tromper de
+            //    plusieurs centaines de metres — inacceptable pour un DT
+            //    qui doit rejoindre une dumping area ;
+            //  - source inconnue.
+            // Seul un recepteur GNSS externe remplit ces colonnes.
+            values: !session.positionFiable
                 ? const ['—', '—', '—']
                 : [
                     '${session.easting}',
@@ -346,34 +378,16 @@ class _TopBar extends StatelessWidget {
   Widget build(BuildContext context) {
     final double k = MiseEnPage.depuis(context).k;
 
-    // Responsive : les badges ont une taille plancher (lisibilite). Sur un
-    // ecran etroit (telephone portrait), leur somme depassait la largeur et
-    // la barre debordait. Chaque groupe passe donc par un FittedBox
-    // `scaleDown` : taille normale quand ca tient, reduit sinon — jamais de
-    // debordement.
-    // Barre a quatre badges d'etat : 4G a gauche du nom, puis BLE, Wi-Fi
-    // (hotspot) et GPS a droite. Chaque badge passe par `_BadgeAdaptatif` :
-    // sa boite garde sa proportion au lieu d'etre rognee par un FittedBox,
-    // qui coupait le libelle et faisait deborder la barre.
+    // Les quatre voyants sont passes dans le bandeau du haut, communs aux
+    // trois profils : ici ne reste que le nom, qui dispose de toute la
+    // largeur et peut donc etre lu de loin.
     return Row(
-      crossAxisAlignment: CrossAxisAlignment.center,
       children: [
-        // Reseau externe (vers le serveur) : la 4G.
-        Flexible(
-          flex: 1,
-          child: _BadgeAdaptatif(
-            alignement: Alignment.centerLeft,
-            child: GsmStatusBadge(etat: session.etat4GAffiche),
-          ),
-        ),
         Expanded(
-          flex: 2,
           child: Center(
             child: FittedBox(
               fit: BoxFit.scaleDown,
               child: Text(
-                // Nom de l'equipement (ou titre du profil tant qu'il n'est
-                // pas connu).
                 session.deviceName.isEmpty
                     ? (session.profile?.titre ?? 'DT')
                     : session.deviceName,
@@ -387,80 +401,18 @@ class _TopBar extends StatelessWidget {
             ),
           ),
         ),
-        // Liens P2P et capteurs a droite du nom : BLE (voyant bluetooth,
-        // excavatrices), Wi-Fi hotspot (voyant wifi, spotters) puis GPS
-        // externe USB-C. TAB 2 est aussi la passerelle BLE et le point
-        // d'acces Wi-Fi (CDC §6) : les deux badges sont presents en
-        // permanence, rouge des que la couche n'est pas demarree.
-        Flexible(
-          flex: 3,
-          child: _BadgeAdaptatif(
-            alignement: Alignment.centerRight,
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // Test direct de la voix off : deverrouille l'audio du
-                // navigateur web (autoplay policy) puis fait parler le TTS.
-                // Utile des l'arrivee sur l'ecran, sans attendre une alerte.
-                IconButton(
-                  tooltip: 'Tester la voix off',
-                  icon: Icon(
-                    Icons.volume_up,
-                    size: 26 * k,
-                    color: AppColors.ink,
-                  ),
-                  onPressed: () async {
-                    session.alerter.deverrouillerAudioWeb();
-                    await session.alerter
-                        .dire('Test de la voix off, alerte trajet operationnelle');
-                  },
-                ),
-                SizedBox(width: 6 * k),
-                BleStatusBadge(
-                  etat: session.etatBleAffiche,
-                  nombreClients: session.liensBle,
-                ),
-                SizedBox(width: 10 * k),
-                WifiP2pStatusBadge(
-                  etat: session.etatWifiAffiche,
-                  nombreClients: session.liensWifi,
-                ),
-                SizedBox(width: 10 * k),
-                GpsStatusBadge(etat: session.etatGpsAffiche),
-              ],
-            ),
-          ),
+        // Test de la voix off, conserve : il n'a pas sa place dans le
+        // bandeau (c'est une action, pas un voyant).
+        IconButton(
+          tooltip: 'Tester la voix off',
+          icon: Icon(Icons.volume_up, size: 26 * k, color: AppColors.ink),
+          onPressed: () async {
+            session.alerter.deverrouillerAudioWeb();
+            await session.alerter
+                .dire('Test de la voix off, alerte trajet operationnelle');
+          },
         ),
       ],
-    );
-  }
-}
-
-/// Boite un badge (ou un groupe de badges) en le mettant a l'echelle de la
-/// place disponible **dans les deux sens**.
-///
-/// Un `FittedBox` seul se contente de rogner le dessin : la boite gardait sa
-/// hauteur, le libelle etait coupe et la barre du haut debordait. Ici le
-/// facteur d'echelle est calcule, puis applique aux deux dimensions — le
-/// badge devient plus petit mais reste entier et lisible.
-class _BadgeAdaptatif extends StatelessWidget {
-  const _BadgeAdaptatif({required this.child, required this.alignement});
-
-  final Widget child;
-  final Alignment alignement;
-
-  @override
-  Widget build(BuildContext context) {
-    return Align(
-      alignment: alignement,
-      // Le badge garde sa taille naturelle (aucune contrainte infinie, donc
-      // aucun plantage au layout) ; s'il ne rentre pas dans la place laissee
-      // par la ligne, il est reduit d'autant, entier et lisible.
-      child: FittedBox(
-        fit: BoxFit.scaleDown,
-        alignment: alignement,
-        child: child,
-      ),
     );
   }
 }
@@ -705,3 +657,5 @@ class _RouteBar extends StatelessWidget {
     );
   }
 }
+
+

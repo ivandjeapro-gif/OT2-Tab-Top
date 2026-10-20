@@ -12,6 +12,7 @@ import '../state/session.dart';
 import '../theme/app_theme.dart';
 import '../theme/responsive.dart';
 import '../widgets/profile_shell.dart';
+import '../widgets/voyants_entete.dart';
 import 'spotter_relire.dart';
 
 /// Ecran du spotter geologique.
@@ -862,6 +863,7 @@ class _SpotterScreenState extends State<SpotterScreen> {
     // choix alors que la session a deja change.
     return ProfileShell(
       session: session,
+      voyants: ProfilVoyants.spotter,
       body: ListenableBuilder(
         listenable: session,
         builder: (context, _) {
@@ -2196,3 +2198,5 @@ class _BoutonRelire extends StatelessWidget {
     );
   }
 }
+
+

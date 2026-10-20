@@ -6,6 +6,7 @@ import '../theme/app_theme.dart';
 import '../theme/responsive.dart';
 import '../widgets/profile_shell.dart';
 import '../widgets/status_badges.dart';
+import '../widgets/voyants_entete.dart';
 
 /// Ecran de l'excavatrice : compteurs E/N/E rafraichis a chaque synchro.
 class ExcavatorScreen extends StatelessWidget {
@@ -17,6 +18,7 @@ class ExcavatorScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     return ProfileShell(
       session: session,
+      voyants: ProfilVoyants.excavatrice,
       body: ListenableBuilder(
         listenable: session,
         builder: (context, _) {
@@ -78,7 +80,7 @@ class ExcavatorScreen extends StatelessWidget {
                             // que la couche BLE est inversee cote excavator.
                             Text(
                               session.dtConnecte.isEmpty
-                                  ? 'Aucun DT dans le rayon'
+                                  ? 'Aucun DT connecte'
                                   : 'DT ${session.dtConnecte} · '
                                       '${session.positionsPerle} position(s)',
                               maxLines: 1,
@@ -89,29 +91,35 @@ class ExcavatorScreen extends StatelessWidget {
                                 color: const Color(0xFF6E7278),
                               ),
                             ),
+                            // Identifiants du point d'acces, en clair.
+                            //
+                            // C'est la seule voie qui reste quand le BLE
+                            // n'emet pas sur ce modele : l'operateur les
+                            // saisit UNE fois sur chaque tablette, Android
+                            // memorise le reseau, et il n'y revient plus.
+                            // Les taire obligerait a deviner un SSID que
+                            // Android a tire au hasard (`AndroidShare_1763`).
+                            if (session.ssidExcavatrice.isNotEmpty)
+                              Text(
+                                'Wi-Fi : ${session.ssidExcavatrice}  '
+                                'mot de passe : ${session.motDePasseExcavatrice}',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  fontFamily: kSerif,
+                                  fontSize: (13 * k).clamp(9.0, 13.0),
+                                  fontWeight: FontWeight.w700,
+                                  color: AppColors.ink,
+                                ),
+                              ),
                           ],
                         ),
                       ),
                     ),
-                    // A droite du nom, les deux liens qui font vivre le
-                    // terrain : le point d'acces (le reseau que les autres
-                    // tablettes rejoignent) et le BLE (le lien qui porte la
-                    // proximite de 10 m et la session perle).
-                    SizedBox(width: 8 * k),
-                    SizedBox(
-                      width: mise.tailleBadge.width,
-                      height: mise.tailleBadge.height,
-                      child: PointAccesStatusBadge(
-                        etat: session.etatPointAcces,
-                        ssid: session.ssidExcavatrice,
-                      ),
-                    ),
-                    SizedBox(width: 8 * k),
-                    SizedBox(
-                      width: mise.tailleBadge.width,
-                      height: mise.tailleBadge.height,
-                      child: BleStatusBadge(etat: session.etatBle),
-                    ),
+                    // Les voyants (GPS, point d'acces, BLE) sont passes dans
+                    // le bandeau du haut : ils ne prennent plus de place ici,
+                    // et le nom dispose de toute la largeur.
                   ],
                 ),
                 // Ecart proportionnel : il fait partie de la repartition

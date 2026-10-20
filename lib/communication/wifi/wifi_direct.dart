@@ -75,6 +75,7 @@ class WifiDirect {
         erreur: reponse['erreur']?.toString(),
         ssid: reponse['ssid']?.toString(),
         motDePasse: reponse['motDePasse']?.toString(),
+        adresse: reponse['adresse']?.toString(),
         type: reponse['type']?.toString() ?? 'inconnu',
       );
     } on PlatformException catch (e) {
@@ -141,6 +142,46 @@ class WifiDirect {
     }
   }
 
+  /// Rejoint le point d'acces de l'excavatrice, avec les identifiants qu'elle
+  /// a annonces (SSID et mot de passe attribues par Android).
+  ///
+  /// C'est la voie normale depuis que le hotspot remplace Wi-Fi Direct : le
+  /// SSID n'est plus `ORE-EXC` mais `AndroidShare_xxxx`, donc un scan par
+  /// prefixe ne trouve rien — il faut viser le reseau exact.
+  ///
+  /// Le systeme memorise ensuite la connexion : les fois suivantes se font
+  /// sans nouvelle saisie, ni appel a cette methode.
+  static Future<bool> rejoindreReseau(
+    String ssid,
+    String motDePasse,
+  ) async {
+    if (!_estAndroid) return false;
+    if (ssid.trim().isEmpty) return false;
+    try {
+      final Map<Object?, Object?>? reponse =
+          await _canal.invokeMethod<Map<Object?, Object?>>(
+        'rejoindre_reseau',
+        <String, Object?>{'ssid': ssid, 'motDePasse': motDePasse},
+      );
+      return reponse?['ok'] == true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Adresse IPv4 locale de l'interface Wi-Fi (celle qui joint le TCP).
+  static Future<String?> adresseLocale() async {
+    if (!_estAndroid) return null;
+    try {
+      final Map<Object?, Object?>? r =
+          await _canal.invokeMethod<Map<Object?, Object?>>('adresse_locale');
+      final Object? a = r?['adresseLocal'];
+      return a == null ? null : '$a';
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// Se connecte au groupe [nom] (celui de l'excavatrice).
   ///
   /// Le groupe doit avoir ete vu au prealable par [decouvrir] : Wi-Fi Direct
@@ -199,6 +240,7 @@ class DemarrageReseau {
     this.erreur,
     this.ssid,
     this.motDePasse,
+    this.adresse,
     this.type = 'inconnu',
   });
 
@@ -206,6 +248,10 @@ class DemarrageReseau {
   final String? erreur;
   final String? ssid;
   final String? motDePasse;
+
+  /// IP du point d'acces : c'est elle que les clients joignent en TCP.
+  final String? adresse;
+
   final String type;
 
   @override

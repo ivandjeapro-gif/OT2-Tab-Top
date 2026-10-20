@@ -388,7 +388,12 @@ class WifiP2pStatusBadge extends StatelessWidget {
       // au lieu d'un gris fixe, pour se lire comme les autres voyants.
       couleur: color,
       epaisseur: (2 * k).clamp(1.0, 2.0),
-      enfant: Column(
+      // Le contenu se comprime avec la boite : sur un voyant de 22 px de
+      // haut (telephone en paysage), l'icone a sa taille pleine debordait de
+      // 3 px. Le `FittedBox` reduit l'ensemble au lieu de rogner.
+      enfant: FittedBox(
+        fit: BoxFit.scaleDown,
+        child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -406,6 +411,7 @@ class WifiP2pStatusBadge extends StatelessWidget {
             ),
           ),
         ],
+        ),
       ),
       remplir: remplir,
     );
@@ -611,10 +617,13 @@ class PointAccesStatusBadge extends StatelessWidget {
 
   String get _libelle {
     if (etat != EtatCouche.connecte) return etat.libelle;
-    // SSID trop long pour le cadre : on garde la fin, qui porte le suffixe
-    // discriminant (`AndroidShare_6247` -> `…_6247`).
+    // Le cadre est etroit : seuls les caracteres qui distinguent deux
+    // excavatrices sont utiles. `AndroidShare_6247` -> `_6247`.
     if (ssid.isEmpty) return 'AP';
-    return ssid.length <= 10 ? ssid : '…${ssid.substring(ssid.length - 8)}';
+    final String court = ssid.length <= 5
+        ? ssid
+        : '…${ssid.substring(ssid.length - 4)}';
+    return court;
   }
 
   @override
@@ -627,24 +636,28 @@ class PointAccesStatusBadge extends StatelessWidget {
       couleur: color,
       epaisseur: (2 * k).clamp(1.0, 2.0),
       remplir: remplir,
-      enfant: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(Icons.wifi_tethering, size: (46 * k).clamp(20.0, 46.0), color: color),
-          SizedBox(height: (4 * k).clamp(2.0, 4.0)),
-          Text(
-            _libelle,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontFamily: kSerif,
-              fontSize: (13 * k).clamp(9.0, 13.0),
-              color: color,
-              fontWeight: FontWeight.w700,
+      enfant: FittedBox(
+        fit: BoxFit.scaleDown,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.wifi_tethering,
+                size: (38 * k).clamp(18.0, 38.0), color: color),
+            SizedBox(height: (2 * k).clamp(1.0, 2.0)),
+            Text(
+              _libelle,
+              maxLines: 1,
+              softWrap: false,
+              style: TextStyle(
+                fontFamily: kSerif,
+                fontSize: (12 * k).clamp(8.0, 12.0),
+                color: color,
+                fontWeight: FontWeight.w700,
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
