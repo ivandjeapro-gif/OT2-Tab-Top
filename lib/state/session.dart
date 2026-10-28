@@ -2827,9 +2827,26 @@ feederPerle(mesure);
   /// L'envoi est deja automatique des que le lien est authentifie (Â§16.1) :
   /// ce bouton ne sert qu'a forcer une reprise quand une transmission a
   /// echoue en cours de route (radio coupee, ACK perdu). Contrairement a
-  /// [_retransmettreFileBle] qui sort en silence si le lien est absent, on
-  /// journalise ici pour que l'appui sur le bouton ne soit jamais muet.
-  Future<void> forcerEnvoiBle() async {
+  /// Forcer l'envoi manuel vers le DT (que l'appareil soit client ou passerelle).
+  Future<void> forcerEnvoiManuel() async {
+    final bool localEstExcavatrice =
+        BaseLocale.estTab3(profile?.roleCdc ?? '') ||
+        (profile?.roleCdc ?? '').toUpperCase() == 'EXCAVATOR';
+
+    if (localEstExcavatrice) {
+      final BleGateway? gatewayBle = _gatewayBle;
+      final bool dtBle = gatewayBle != null && gatewayBle.clientsConnectes.isNotEmpty;
+      if (!dtBle) {
+        push('Envoi manuel : aucun DT connecte en BLE');
+        notifyListeners();
+        return;
+      }
+      await _relayerVersDt();
+      push('Envoi manuel : file transmise au DT');
+      notifyListeners();
+      return;
+    }
+
     final BleClient? client = _clientBle;
     if (client == null || !client.connecte) {
       push('Envoi manuel BLE : aucun lien avec le DT - donnees conservees en file');
@@ -2842,9 +2859,12 @@ feederPerle(mesure);
       return;
     }
     await _retransmettreFileBle();
-    push('Envoi manuel BLE : file relancee vers le DT');
+    push('Envoi manuel BLE : file relancee');
     notifyListeners();
   }
+
+  /// Alias pour compatibilite.
+  Future<void> forcerEnvoiBle() => forcerEnvoiManuel();
 
   /// Transmet toute la file PENDING de la base au DT via le client Wi-Fi.
   ///

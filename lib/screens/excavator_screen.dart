@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 
-import '../state/etat_couche.dart';
 import '../communication/wifi/wifi_direct.dart';
 import '../state/session.dart';
 import '../theme/app_theme.dart';
@@ -20,6 +19,7 @@ class ExcavatorScreen extends StatelessWidget {
     // tableau plus bas) : seul le spotter les porte dans le bandeau.
     return ProfileShell(
       session: session,
+      bottomTrailing: BoutonEnvoiManuel(session: session),
       body: ListenableBuilder(
         listenable: session,
         builder: (context, _) {
@@ -384,39 +384,6 @@ class ExcavatorScreen extends StatelessWidget {
                           ),
                         ),
                       ],
-                    ),
-                  ),
-                ),
-                // Envoi manuel de la file BLE vers le DT. L'envoi est deja
-                // automatique des que le lien est authentifie (§16.1) : ce
-                // bouton ne sert qu'a forcer une reprise apres un echec en
-                // cours de route. Desactive quand le lien BLE n'est pas vert
-                // ou quand la file locale est vide (rien a transmettre).
-                SizedBox(height: 12 * k),
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: OutlinedButton.icon(
-                    onPressed: session.etatBle == EtatCouche.connecte &&
-                            session.fileAttenteBle > 0 &&
-                            !session.envoiBleActif
-                        ? () => session.forcerEnvoiBle()
-                        : null,
-                    icon: Icon(
-                      Icons.upload_outlined,
-                      size: (22 * k).clamp(16.0, 22.0),
-                    ),
-                    label: Text(
-                      'Envoi manuel',
-                      style: TextStyle(
-                        fontFamily: kSerif,
-                        fontSize: (15 * k).clamp(11.0, 15.0),
-                      ),
-                    ),
-                    style: OutlinedButton.styleFrom(
-                      padding: EdgeInsets.symmetric(
-                        horizontal: 20 * k,
-                        vertical: 12 * k,
-                      ),
                     ),
                   ),
                 ),

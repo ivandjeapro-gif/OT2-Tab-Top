@@ -18,6 +18,7 @@ class ProfileShell extends StatelessWidget {
     required this.session,
     required this.body,
     this.voyants,
+    this.bottomTrailing,
   });
 
   final Session session;
@@ -26,6 +27,12 @@ class ProfileShell extends StatelessWidget {
   /// Voyants poses dans le bandeau du haut, a gauche du logo.
   /// Null = profil sans voyants.
   final ProfilVoyants? voyants;
+
+  /// Widget affiche a l'extremite droite de la barre de notification.
+  /// Par defaut, le nuage [SyncCloudIcon] (synchro 4G serveur).
+  /// Sur l'excavatrice, remplace par le bouton [BoutonEnvoiManuel] car la pelle
+  /// ne communique pas directement avec le cloud.
+  final Widget? bottomTrailing;
 
   Future<void> _confirmerSortie(BuildContext context) async {
     final bool? quitter = await showDialog<bool>(
@@ -102,8 +109,8 @@ class ProfileShell extends StatelessWidget {
                   Expanded(
                     child: NotificationTicker(session: session),
                   ),
-                  // Nuage a droite : anime pendant une synchro serveur (4G).
-                  SyncCloudIcon(session: session),
+                  // Extremite droite : nuage serveur (DT/spotter) ou envoi manuel (excavatrice).
+                  bottomTrailing ?? SyncCloudIcon(session: session),
                 ],
               ),
             ],

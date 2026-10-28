@@ -722,3 +722,53 @@ class PointAccesStatusBadge extends StatelessWidget {
     return surTap == null ? badge : GestureDetector(onTap: surTap, child: badge);
   }
 }
+
+/// Bouton "Envoi manuel" remplacant le nuage sur l'ecran Excavator.
+///
+/// L'excavatrice ne communique pas directement avec le cloud en vrai : elle
+/// relaie ses donnees au DT en local (BLE / Wi-Fi). Ce bouton declenche
+/// immediatement le vidage de la file locale vers le camion connecte.
+class BoutonEnvoiManuel extends StatelessWidget {
+  const BoutonEnvoiManuel({super.key, required this.session});
+
+  final Session session;
+
+  @override
+  Widget build(BuildContext context) {
+    final MiseEnPage mise = MiseEnPage.depuis(context);
+    final double k = mise.k;
+    final double hauteur = mise.hauteurTicker;
+
+    return Material(
+      color: AppColors.darkSquare,
+      child: InkWell(
+        onTap: () => session.forcerEnvoiManuel(),
+        child: Container(
+          height: hauteur,
+          padding: EdgeInsets.symmetric(horizontal: (14 * k).clamp(10.0, 18.0)),
+          alignment: Alignment.center,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.upload_outlined,
+                color: Colors.white,
+                size: (20 * k).clamp(16.0, 22.0),
+              ),
+              SizedBox(width: (6 * k).clamp(4.0, 8.0)),
+              Text(
+                'Envoi manuel',
+                style: TextStyle(
+                  fontFamily: kSerif,
+                  fontSize: (14 * k).clamp(11.0, 15.0),
+                  fontWeight: FontWeight.w700,
+                  color: Colors.white,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
