@@ -1203,6 +1203,9 @@ class Session extends ChangeNotifier {
     easting = mesure.easting;
     northing = mesure.northing;
     elevation = mesure.elevation;
+    base.journaliser(
+      'GPS position : ${mesure.easting}, ${mesure.northing}, ${mesure.elevation}m',
+    );
 
 // Profil excavator (Â§2.3) : pendant qu'un DT est connecte, chaque position
 // GNSS de la perle est envoyee en coordonnees de bloc ET accumulee pour la
@@ -1337,11 +1340,12 @@ feederPerle(mesure);
       dt: session.dt,
     );
     session.ajouter(xbloc: xbloc, ybloc: ybloc, zbloc: zbloc);
-    // Trace a la premiere mesure de chaque session seulement : journaliser
-    // chaque point (toutes les 5 s) noierait le fichier.
-    if (session.nombre == 1) {
-      base.journaliser('PERLE premiere position de la session ${session.dt}');
-    }
+    base.journaliser(
+      'Perle godet : $xbloc, $ybloc, $zbloc (#${session.nombre} -> DT ${session.dt})',
+    );
+    // Relais immediat de la position vers le DT connecte : pas besoin
+    // d'attendre le timer de 10 s, chaque godet part en temps reel.
+    unawaited(_relayerVersDt());
   }
 
   /// Vrai des que le serveur a pose au moins une affectation.
@@ -1755,14 +1759,18 @@ feederPerle(mesure);
       // Meme canal de relais que le Wi-Fi : le DT recoit par BLE ce que
       // l'excavatrice lui pousse, le stocke, puis acquitte (ACK du lien).
       client.surEvenement = (Map<String, Object?> evenement) {
-        // JOURNAL : c'est l'activite REELLE du DT, et elle etait invisible.
-        // Sans cette ligne, la supervision du DT restait figee sur le seul
-        // « authentifie par TAB 2 » alors que des evenements arrivaient en
-        // continu par le relais (constat du 27/10).
-        BaseLocale.journaliserReseau(
-          'BLE recu ${evenement['event_type'] ?? '?'} '
-          'de ${evenement['source_device'] ?? '?'}',
-        );
+        final String type = '${evenement['event_type'] ?? '?'}';
+        final String src = '${evenement['source_device'] ?? '?'}';
+        final Object? payload = evenement['payload'];
+        String detail = '';
+        if (payload is Map) {
+          if (payload.containsKey('xbloc')) {
+            detail = ' (${payload['xbloc']}, ${payload['ybloc']}, ${payload['zbloc']})';
+          } else if (payload.containsKey('easting')) {
+            detail = ' (${payload['easting']}, ${payload['northing']})';
+          }
+        }
+        base.journaliser('BLE recu $type de $src$detail');
         _recevoirRelais(evenement, acquitter: (String id) async {
           await client.envoyer(_enveloppeAck(id, client.sourceDevice));
         });
@@ -1899,6 +1907,9 @@ feederPerle(mesure);
       // a rejoindre. C'est ce qui evite toute saisie manuelle cote client.
       gateway.surConnexion = (String source) {
         ouvrirSessionPerle(source);
+        // Des qu'un DT se connecte en BLE, demarrer la boucle de relais
+        // vers lui et forcer un premier envoi immediat des evenements en attente.
+        _demarrerRelaisVersDt();
         unawaited(_provisionnerClient(gateway, source));
       };
       gateway.surProvisionRecue = (String source, Map<String, Object?> m) {
@@ -1907,10 +1918,15 @@ feederPerle(mesure);
           notifyListeners();
         }
       };
-      gateway.surDeconnexion = (String _) => fermerSessionPerle();
+      gateway.surDeconnexion = (String _) {
+        fermerSessionPerle();
+        _relaisTimer?.cancel();
+        _relaisTimer = null;
+      };
       _gatewayBle = gateway;
       await gateway.demarrer();
       bleActif = true;
+      _demarrerRelaisVersDt();
       // Boucle de supervision RSSI (CDC Â§22). Un seul timer a la fois :
       // un redemarrage de la couche BLE annule le precedent.
       _timerRssi?.cancel();
@@ -2759,6 +2775,9 @@ feederPerle(mesure);
           if (evenement['event_id'] == null) continue;
           await gatewayBle.diffuserEvenement(evenement);
           await base.marquerRelaye('${evenement['event_id']}');
+          base.journaliser(
+            'BLE relaye ${evenement['event_type']} -> DT',
+          );
           partis++;
         }
       }

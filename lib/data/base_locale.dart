@@ -868,15 +868,28 @@ class BaseLocale {
     // est la lecture — les vieux messages ne sont jamais rejoues.
     await _rechargerNotifications(db);
 
-    final rowsJournal = await db.query('journal', orderBy: 'rowid DESC');
+    final rowsJournal = await db.query(
+      'journal',
+      orderBy: 'rowid DESC',
+      limit: 150,
+    );
     journal
       ..clear()
       ..addAll(
         rowsJournal.map((row) {
           final String horodatage = row['horodatage']! as String;
-          return '${horodatage.substring(11, 19)}  ${row['requete']! as String}';
+          final String h = horodatage.length >= 19
+              ? horodatage.substring(11, 19)
+              : horodatage;
+          return '$h  ${row['requete']! as String}';
         }),
       );
+    // Au demarrage, alimente immediatement le journal affiche par la
+    // supervision reseau avec l'historique persistant : la liste n'est plus
+    // jamais vide a l'ouverture apres un redemarrage.
+    _journalBle
+      ..clear()
+      ..addAll(journal);
 
     _enAttente = Sqflite.firstIntValue(
           await db.rawQuery(
@@ -1908,18 +1921,7 @@ class BaseLocale {
   /// ecrivait dans son propre journal memoire que personne ne lisait.
   static void journaliserReseau(String texte) {
     for (final BaseLocale b in _instances) {
-      b._journalBle.insert(0, texte);
-      if (b._journalBle.length > 200) b._journalBle.removeLast();
-      // Persistance : sans elle, « journaux pas precis » — la supervision
-      // n'aurait qu'un tampon memoire efface au redemarrage, impossible de
-      // relire ce qui s'est passe pendant une connexion.
-      b.journaliser('[RESEAU] $texte');
-      // NOTIFICATION (27/10) : sans elle, le tampon memoire etait mis a jour
-      // mais aucun widget n'etait repeint — la fenetre de supervision restait
-      // sur « Aucun evenement reseau journalise » alors que des lignes
-      // arrivaient. La session est le Listenable de l'application ; la base
-      // n'est qu'un magasin, d'ou ce relais.
-      b.surJournalReseau?.call(texte);
+      b.journaliser(texte);
     }
   }
 
@@ -1950,13 +1952,18 @@ class BaseLocale {
   /// journal est la preuve de ce que l'application a reellement fait.
   void journaliser(String requete) {
     final String horodatage = DateTime.now().toIso8601String();
-    journal.insert(0, '${horodatage.substring(11, 19)}  $requete');
+    final String ligne = '${horodatage.substring(11, 19)}  $requete';
+    journal.insert(0, ligne);
+    if (journal.length > 200) journal.removeLast();
+    _journalBle.insert(0, ligne);
+    if (_journalBle.length > 200) _journalBle.removeLast();
     _ecrire(
       (Database db) => db.insert(
         'journal',
         <String, Object?>{'horodatage': horodatage, 'requete': requete},
       ),
     );
+    surJournalReseau?.call(requete);
   }
 
   bool _accepter(String requete) {

@@ -54,7 +54,10 @@ class SupervisionReseau extends StatelessWidget {
   }
 
   Widget _contenu(BuildContext context, double k) {
-    final List<String> journal = session.base.journalBle;
+    // Affiche le journal complet (positions GPS, godets de perle, relais BLE,
+    // synchronisations serveur). Utiliser `journalBle` masquait toutes les
+    // positions et ne montrait que les 3 lignes de handshake initial.
+    final List<String> journal = session.base.journal;
 
     return Padding(
       padding: EdgeInsets.all(16 * k),
