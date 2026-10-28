@@ -29,13 +29,26 @@ abstract class TransportBle {
 
 /// Un appareil BLE visible pendant le scan.
 class AppareilBle {
-  const AppareilBle({required this.id, required this.nom, this.rssi});
+  const AppareilBle({
+    required this.id,
+    required this.nom,
+    this.rssi,
+    this.serviceOre = false,
+  });
 
   final String id;
   final String nom;
 
   /// Dernier RSSI mesure pendant le scan (null si inconnu).
   final int? rssi;
+
+  /// Vrai quand l'advertisement annonce NOTRE service GATT.
+  ///
+  /// C'est le SEUL critere de decouverte fiable. Un `localName` peut etre
+  /// absent, tronque a 8-10 octets ou reecrit par le fabricant (31 octets de
+  /// paquet au total) ; un UUID de service fait 16 octets fixes et ne peut
+  /// pas etre rogne. Le nom n'est plus qu'une information d'affichage.
+  final bool serviceOre;
 }
 
 /// Un lien GATT etabli avec un pair, apres negociation MTU.

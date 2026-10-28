@@ -102,10 +102,19 @@ class LigneBlast {
 /// que dans la famille 1500, il ne peut donc pas apparaitre dans une autre
 /// famille.
 class TypeDT {
-  const TypeDT({required this.code, required this.ids});
+  const TypeDT({
+    required this.code,
+    required this.ids,
+    this.role = '',
+  });
 
   final String code;
   final List<String> ids;
+
+  /// Profil proprietaire de cette famille (DT, EXCAVATOR...), porte par la
+  /// colonne `role` de l'onglet `flotte`. La base ne DEDUIT plus rien du nom :
+  /// c'est la jointure fournie par le serveur.
+  final String role;
 
   int get nombreDts => ids.length;
 

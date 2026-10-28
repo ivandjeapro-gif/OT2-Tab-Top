@@ -45,6 +45,24 @@ class _ParametresScreenState extends State<ParametresScreen> {
 
   String _envoiMode = BaseLocale.envoiModeBlast;
 
+  /// Options de connexion : quels transports cette tablette utilise.
+  /// Reflechit l'etat persiste en `meta` au moment de l'ouverture de l'ecran ;
+  /// l'ecriture et l'application effective (demarrage/arret des couches)
+  /// se font avec « Enregistrer ».
+  late bool _transportBle;
+  late bool _transportHotspot;
+  late bool _transportXbee;
+  /// Champ meta.xbee_baudrate : vitesse du port serie USB-C du XBee/GNSS.
+  /// Defaut 115200 = config usine du kit ArduSimple ; modifiable sans rebuild
+  /// si u-center/XCTU a ete reconfigure (9600, 230400...). Vide = defaut.
+  late TextEditingController _baudXbee;
+
+  /// Vitesse XBee valide : chiffres uniquement, entre 9600 et 921600.
+  static bool _vitesseValide(String brut) {
+    final int? v = int.tryParse(brut);
+    return v != null && v >= 9600 && v <= 921600;
+  }
+
   /// Source de position choisie (« GPS tablette » par defaut).
   ChoixGps _choixGps = ChoixGps.tablette;
 
@@ -91,6 +109,10 @@ class _ParametresScreenState extends State<ParametresScreen> {
     _ssidReseau = TextEditingController(text: base.meta('reseau_ssid') ?? '');
     _mdpReseau =
         TextEditingController(text: base.meta('reseau_mot_de_passe') ?? '');
+    _transportBle = session.transportBleActif;
+    _transportHotspot = session.transportHotspotActif;
+    _transportXbee = session.transportXbeeActif;
+    _baudXbee = TextEditingController(text: base.meta('xbee_baudrate') ?? '');
   }
 
   @override
@@ -185,6 +207,23 @@ class _ParametresScreenState extends State<ParametresScreen> {
     await base.majMeta('delai_confirmation_s', delai.toString());
     await base.majMeta('intervalle_gps_s', intervalle.toString());
     await base.majMeta('filtre_distance_gps_m', filtre.toString());
+    // Options de connexion : une case decochee stoppe la couche associee apres
+    // l'enregistrement (et supprime son badge en supervision) ; une case
+    // recochee la redemarre. Le changement s'applique donc sans redemarrage.
+    await base.majMeta('transport_ble', _transportBle ? '1' : '0');
+    await base.majMeta('transport_hotspot', _transportHotspot ? '1' : '0');
+    await base.majMeta('transport_xbee', _transportXbee ? '1' : '0');
+    // Baudrate XBee : vide = defaut 115200 (celui d'usine du XBee 3).
+    final String baudBrut = _baudXbee.text.trim();
+    await base.majMeta('xbee_baudrate', baudBrut);
+    await base.majMeta('xbee_baudrate_eff',
+        _vitesseValide(baudBrut) ? baudBrut : '115200');
+    // Un changement d'option ne concerne que les couches locales : il n'a de
+    // sens qu'une fois le profil connu (`profile`), sinon `demarrerCouchesLocales`
+    // sortirait immediatement sans rien faire.
+    if (session.profile != null) {
+      await session.demarrerCouchesLocales();
+    }
 
     // Seuils + GPS appliques en direct (api_* et envoi_mode sont relus a
     // chaque envoi, ils n'ont pas besoin d'etre recharge).
@@ -270,6 +309,91 @@ class _ParametresScreenState extends State<ParametresScreen> {
                       ),
                     ],
                     SizedBox(height: 24 * k),
+                    _Section(
+                      k: k,
+                      titre: 'Options de connexion',
+                    ),
+                    // Transports que cette tablette utilise. Un mode decoche
+                    // n'est ni demarre apres l'authentification, ni affiche
+                    // dans la supervision : l'utilisateur ne voit que ce qu'il
+                    // a coche lui-meme.
+                    CheckboxListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      value: _transportBle,
+                      onChanged: (bool? v) => setState(() => _transportBle = v ?? true),
+                      activeColor: AppColors.slate,
+                      controlAffinity: ListTileControlAffinity.leading,
+                      title: Text(
+                        'BLE - liaison directe avec l\'autre machine',
+                        style: TextStyle(
+                          fontFamily: kSerif,
+                          fontSize: (15 * k).clamp(12.0, 15.0),
+                          color: AppColors.ink,
+                        ),
+                      ),
+                    ),
+                    CheckboxListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      value: _transportHotspot,
+                      onChanged: (bool? v) => setState(() => _transportHotspot = v ?? true),
+                      activeColor: AppColors.slate,
+                      controlAffinity: ListTileControlAffinity.leading,
+                      title: Text(
+                        'Hotspot - point d\'acces Wi-Fi de l\'excavatrice',
+                        style: TextStyle(
+                          fontFamily: kSerif,
+                          fontSize: (15 * k).clamp(12.0, 15.0),
+                          color: AppColors.ink,
+                        ),
+                      ),
+                    ),
+                    CheckboxListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      value: _transportXbee,
+                      onChanged: (bool? v) => setState(() => _transportXbee = v ?? false),
+                      activeColor: AppColors.slate,
+                      controlAffinity: ListTileControlAffinity.leading,
+                      title: Text(
+                        'XBee - radio longue portee',
+                        style: TextStyle(
+                          fontFamily: kSerif,
+                          fontSize: (15 * k).clamp(12.0, 15.0),
+                          color: AppColors.ink,
+                        ),
+                      ),
+                      subtitle: Text(
+                        'Port USB-C du GNSS ArduSimple (un seule base radio)',
+                        style: TextStyle(
+                          fontSize: (12 * k).clamp(10.0, 12.0),
+                          color: const Color(0xFF6E7278),
+                        ),
+                      ),
+                    ),
+                    // Baudrate du port serie USB-C : doit rester identique a
+                    // la config u-center/XCTU des modules. Le defaut est
+                    // 115200 (usine du kit ArduSimple) ; un site avec des
+                    // modules reconfigurees le change ici sans rebuild.
+                    Padding(
+                      padding: EdgeInsets.only(left: 16 * k),
+                      child: TextField(
+                        controller: _baudXbee,
+                        keyboardType: TextInputType.number,
+                        decoration: InputDecoration(
+                          labelText: 'Baudrate XBee (defaut 115200)',
+                          hintText: '115200',
+                          errorText: _baudXbee.text.isNotEmpty &&
+                                  !_vitesseValide(_baudXbee.text.trim())
+                              ? 'Entre 9600 et 921600'
+                              : null,
+                        ),
+                        style: TextStyle(fontSize: 14 * k),
+                        onChanged: (_) => setState(() {}),
+                      ),
+                    ),
+                    SizedBox(height: 16 * k),
                     _Section(
                       k: k,
                       titre: 'Envoi des donnees du spotter',

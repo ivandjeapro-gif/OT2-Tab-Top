@@ -34,11 +34,28 @@ class _LoginScreenState extends State<LoginScreen> {
   String? _id;
   String? _name;
 
+  /// Famille choisie (machines : DT/EXCAVATOR). Null pour les personnes.
+  String? _famille;
+
+  /// Équipe choisie (personnes : SPOT). Le menu 2 liste les noms de l'equipe.
+  String? _equipe;
+
   @override
   void initState() {
     super.initState();
     final List<Profil> profils = widget.session.base.profilsActifs;
-    _profil = profils.isEmpty ? null : profils.first;
+    // Verrouillage de role (PARAMETRES.md) : si cette tablette a deja porte
+    // un role (`role_verrouille`), on le re-selectionne au demarrage — l'oper
+    // rateur retrouve d'emblée le bon écran, sans re-apprendre le profil.
+    final String verrou = (widget.session.base.meta('role_verrouille') ?? '').trim();
+    _profil = profils.isEmpty
+        ? null
+        : (verrou.isNotEmpty
+            ? profils.firstWhere(
+                (Profil p) => p.roleCdc == verrou,
+                orElse: () => profils.first,
+              )
+            : profils.first);
     widget.session.addListener(_surSession);
   }
 
@@ -53,20 +70,90 @@ class _LoginScreenState extends State<LoginScreen> {
     final List<Profil> profils = widget.session.base.profilsActifs;
     setState(() {
       if (_profil == null && profils.isNotEmpty) {
-        _profil = profils.first;
+        // Reprise du verrou si present, sinon le premier profil actif.
+        final String verrou = (widget.session.base.meta('role_verrouille') ?? '').trim();
+        _profil = verrou.isNotEmpty
+            ? profils.firstWhere(
+                (Profil p) => p.roleCdc == verrou,
+                orElse: () => profils.first,
+              )
+            : profils.first;
       }
     });
   }
 
   void _choisirProfil(Profil profil) {
+    // Verrouillage de role (PARAMETRES.md) : une tablette qui a deja porte un
+    // role (`role_verrouille` dans `meta`) refuse silencieusement un autre
+    // role sauf confirmation explicite — cela evite qu'une erreur d'appui
+    // remonte les couches BLE / Wi-Fi Direct de la session.
+    final String? verrou = widget.session.base.meta('role_verrouille');
+    if (verrou != null && verrou != profil.roleCdc) {
+      _demanderDeverrouillage(profil);
+      return;
+    }
     setState(() {
       _profil = profil;
+      _id = null;
+      _name = null;
+      _famille = null;
+      _equipe = null;
+    });
+  }
+
+  /// Dialogue de confirmation avant de changer le role verrouille.
+  Future<void> _demanderDeverrouillage(Profil profil) async {
+    final bool? confirme = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext contexte) => AlertDialog(
+        title: const Text('Changer de role ?'),
+        content: Text(
+          'Cette tablette est verrouillee sur un autre role. '
+          'Voulez-vous vraiment la passer en « ${profil.libelle} » ?',
+        ),
+        actions: <Widget>[
+          TextButton(
+            onPressed: () => Navigator.of(contexte).pop(false),
+            child: const Text('Annuler'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(contexte).pop(true),
+            child: const Text('Changer'),
+          ),
+        ],
+      ),
+    );
+    if (confirme != true || !mounted) return;
+    // Le role change : on efface tout l'etat BLE / Wi-Fi Direct (groupes,
+    // advertising, connexions TCP) pour que la nouvelle role redemarre sur des
+    // couches propres — jamais de restes de l'ancienne configuration.
+    widget.session.disconnect();
+    // Le verrou suit le nouveau role choisi (la connexion le re-pose aussi).
+    await widget.session.base.majMeta('role_verrouille', profil.roleCdc);
+    setState(() {
+      _profil = profil;
+      _id = null;
+      _name = null;
+      _famille = null;
+      _equipe = null;
+    });
+  }
+
+  void _choisirMenu1(String? valeur) {
+    setState(() {
+      // Famille (machines) ou Equipe (spotter) : le changement invalide le
+      // second choix, qui n'appartient peut-etre plus a la nouvelle valeur.
+      if (BaseLocale.estTab1(_profil?.roleCdc ?? '')) {
+        _equipe = valeur;
+      } else {
+        _famille = valeur;
+      }
       _id = null;
       _name = null;
     });
   }
 
-  void _connecter() {
+  Future<void> _connecter() async {
     final Profil? profil = _profil;
     if (profil == null) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -122,14 +209,22 @@ class _LoginScreenState extends State<LoginScreen> {
       return;
     }
 
-    // L'ecran suit le role CDC du profil (REQ-002) : TAB 1 = spotter,
-    // TAB 2 = DT, TAB 3 = excavatrice. Le libelle, lui, vient de la table.
+    // Connexion reussie : la tablette est desormais verrouillee sur ce role.
+    // Au prochain demarrage, ce role sera pre-selectionne et un autre choix
+    // demandera une confirmation (voir _choisirProfil).
+    if (widget.session.base.meta('role_verrouille') != profil.roleCdc) {
+      await widget.session.base.majMeta('role_verrouille', profil.roleCdc);
+    }
+
+    // L'ecran suit le role CDC du profil (REQ-002) : TAB 2 = spotter,
+    // TAB 3 = excavatrice, TAB 1 = DT. Le libelle, lui, vient de la table.
     final Widget ecran = BaseLocale.estTab2(profil.roleCdc)
         ? DtScreen(session: widget.session)
         : BaseLocale.estTab3(profil.roleCdc)
             ? ExcavatorScreen(session: widget.session)
             : SpotterScreen(session: widget.session);
 
+    if (!mounted) return;
     Navigator.of(context).pushReplacement(
       MaterialPageRoute<void>(builder: (_) => ecran),
     );
@@ -252,36 +347,67 @@ class _LoginScreenState extends State<LoginScreen> {
       mise: mise,
       compactPortrait: MiseEnPage.estCompactPortrait(context),
     );
+    // Serveur final : TOUS les profils ont DEUX menus dependants, servis
+    // par la base — jamais par le code :
+    //  - machines (DT, EXCAVATOR) : menu 1 = FAMILLE (colonne `role` de la
+    //    flotte), menu 2 = Identifiant unique (numero de la famille) ;
+    //  - personnes (SPOT)          : menu 1 = EQUIPE (colonne `equipe` des
+    //    identifiants), menu 2 = Nom (membres de l'equipe).
+    final bool estSpotter = _profil != null &&
+        BaseLocale.estTab1(_profil!.roleCdc);
+    final List<String> elementsMenu1 = _profil == null
+        ? const <String>[]
+        : (estSpotter
+            ? widget.session.base.equipesDuProfil(_profil!)
+            : widget.session.base.famillesDuProfil(_profil!));
+    final String? valeurMenu1 = estSpotter ? _equipe : _famille;
     final List<String> ids = _profil == null
         ? const <String>[]
-        : widget.session.base.idsDuProfil(_profil!);
+        : (estSpotter && _equipe != null
+            ? widget.session.base.idsDEquipe(_profil!, _equipe!)
+            : (_famille != null && !estSpotter
+                ? widget.session.base.idsDuFamille(_profil!, _famille!)
+                : widget.session.base.idsDuProfil(_profil!)));
     final List<String> noms = _profil == null
         ? const <String>[]
-        : widget.session.base.nomsDuProfil(_profil!);
-    final bool estNominatif = _profil != null &&
-        (BaseLocale.estTab1(_profil!.roleCdc) ||
-            (ids.isNotEmpty &&
-                ids.length == noms.length &&
-                ids.every((i) => noms.contains(i))));
+        : (estSpotter && _equipe != null
+            ? widget.session.base.nomsDEquipe(_profil!, _equipe!)
+            : (_famille != null && !estSpotter
+                ? widget.session.base.nomsDeFamille(_profil!, _famille!)
+                : widget.session.base.nomsDuProfil(_profil!)));
 
     final Widget colonneIdentifiants = _Credentials(
-      // Identifiants et noms enrroles lus dans la base (REQ-002) : les deux
-      // menus sortent de la meme table, pas du code.
+      // Serveur final : DEUX menus dependants pour tous les profils.
+      // Machine : Famille -> Identifiant ; Spotter : Equipe -> Nom.
+      libelleMenu1: estSpotter ? 'Equipe' : 'Famille',
+      valeurMenu1: valeurMenu1,
+      elementsMenu1: elementsMenu1,
+      surMenu1: _choisirMenu1,
+      libelleMenu2: estSpotter ? 'Nom' : 'Identifiant unique',
+      champIdentifiant: !estSpotter,
       ids: ids,
       noms: noms,
       id: _id,
       nom: _name,
-      estNominatif: estNominatif,
       surId: (v) => setState(() {
-        _id = v;
-        if (_profil != null && v != null) {
-          _name = widget.session.base.nomDuProfil(_profil!, v) ?? _name;
+        // L'UI manipule le NUMERO SEUL (menu 2) ; la session recoit l'ID
+        // COMPOSE (famille-numero), cle des equipements. Sans ce resolver,
+        // la validation du couple refusait un numero qui existe pourtant.
+        final String? compose = (_profil != null && _famille != null)
+            ? widget.session.base.idDeFamille(_profil!, _famille!, v ?? '')
+            : null;
+        _id = compose ?? v;
+        if (_profil != null && _id != null) {
+          _name = widget.session.base.nomDuProfil(_profil!, _id!) ?? _name;
         }
       }),
       surNom: (v) => setState(() {
         _name = v;
         if (_profil != null && v != null) {
-          _id = widget.session.base.idDuProfil(_profil!, v) ?? _id;
+          final String? idResolu = estSpotter && _equipe != null
+              ? widget.session.base.idDeEquipe(_profil!, _equipe!, v)
+              : widget.session.base.idDuProfil(_profil!, v);
+          _id = idResolu ?? _id;
         }
       }),
       surConnexion: _connecter,
@@ -552,17 +678,19 @@ class _ProfilePicker extends StatelessWidget {
           ),
         for (int i = 0; i < profils.length; i++) ...[
           if (i > 0) SizedBox(height: mise.ecartElement),
+          // MEME hauteur que les champs de la colonne d'en face
+          // (`mise.hauteurBouton`, borne a 54 px comme `SelectField` et
+          // « Connect »). Le mode compact raccourcissait les badges de
+          // profil a ~54 px alors que les menus restaient a leur hauteur :
+          // les deux colonnes ne s'alignaient plus et les badges de
+          // SPOTTER/EXCAVATOR paraissaient plus petits que les autres.
           _ProfileButton(
             key: ValueKey<String>('profil-${profils[i].code}'),
             libelle: profils[i].libelle,
             selectionne: profils[i] == profil,
             surAppui: () => surChangement(profils[i]),
-            hauteur: compactPortrait
-                ? (54 * mise.k).clamp(48.0, 58.0)
-                : mise.hauteurBouton,
-            police: compactPortrait
-                ? 18
-                : (21 * mise.k).clamp(15.0, 21.0),
+            hauteur: mise.hauteurBouton < 54 ? 54 : mise.hauteurBouton,
+            police: (21 * mise.k).clamp(15.0, 21.0),
           ),
         ],
       ],
@@ -627,6 +755,11 @@ class _ProfileButton extends StatelessWidget {
 
 class _Credentials extends StatelessWidget {
   const _Credentials({
+    required this.libelleMenu1,
+    required this.valeurMenu1,
+    required this.elementsMenu1,
+    required this.surMenu1,
+    required this.libelleMenu2,
     required this.ids,
     required this.noms,
     required this.id,
@@ -635,11 +768,36 @@ class _Credentials extends StatelessWidget {
     required this.surNom,
     required this.surConnexion,
     required this.mise,
-    this.estNominatif = false,
+    this.champIdentifiant = true,
     this.compactPortrait = false,
   });
 
-  /// Identifiants et noms du role choisi, tous deux lus dans `equipements`.
+  /// Menu 1 (dependance) : Famille pour les machines, Equipe pour le spotter.
+  final String libelleMenu1;
+  final String? valeurMenu1;
+  final List<String> elementsMenu1;
+  final ValueChanged<String?> surMenu1;
+
+  /// Menu 2 : Identifiant unique (machines) ou Nom (spotter).
+  final String libelleMenu2;
+
+  /// Vrai si le menu 2 est un IDENTIFIANT machine (deduit le nom du couple).
+  /// Pour le spotter, le menu 2 EST deja un nom — pas de troisieme champ.
+  final bool champIdentifiant;
+
+  /// Valeur AFFICHEE par le menu 2 : le numero seul extrait de l'ID compose
+  /// (`EX-2000` -> `2000`, `1500-1` -> `1`). Le DropdownButton n'accepte que
+  /// des valeurs presentes dans `ids` ; l'ID compose reste la verite stockee
+  /// et transmise a la session.
+  String? get valeurIdAffichee {
+    if (id == null) return null;
+    if (!champIdentifiant) return nom;
+    if (ids.contains(id)) return id;
+    final int i = id!.indexOf('-');
+    return i >= 0 ? id!.substring(i + 1) : id;
+  }
+
+  /// Identifiants et noms du role choisi, tous deux lus dans la base.
   ///
   /// Meme longueur, meme ordre : les deux menus presentent les lignes de la
   /// meme table, et c'est [BaseLocale.nomDu] qui valide le couple au moment
@@ -652,7 +810,6 @@ class _Credentials extends StatelessWidget {
   final ValueChanged<String?> surNom;
   final VoidCallback surConnexion;
   final MiseEnPage mise;
-  final bool estNominatif;
   final bool compactPortrait;
 
   @override
@@ -663,32 +820,35 @@ class _Credentials extends StatelessWidget {
           : MainAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: [
-        if (estNominatif) ...[
-          // Profil nominatif (ex. Spotter) : un seul champ pour la personne.
-          SelectField(
-            key: const ValueKey<String>('champ-nom'),
-            indice: 'Nom du spotter',
-            valeur: nom ?? id,
-            elements: noms.isNotEmpty ? noms : ids,
-            surChangement: (v) {
-              surNom(v);
-              surId(v);
-            },
-            mise: mise,
-          ),
-        ] else ...[
+        SelectField(
+          key: const ValueKey<String>('champ-menu1'),
+          indice: libelleMenu1,
+          valeur: valeurMenu1,
+          elements: elementsMenu1,
+          surChangement: surMenu1,
+          mise: mise,
+        ),
+        SizedBox(height: compactPortrait ? 10 : mise.ecartElement),
+        // Serveur final : DEUX champs par profil, pas trois. Pour les
+        // machines, le nom est deduit de l'identifiant (le menu 2 du spotter
+        // EST le nom) — un troisieme champ ne ferait que deborder sur les
+        // ecrans paysage bas (844x390...).
+        if (champIdentifiant) ...[
           SelectField(
             key: const ValueKey<String>('champ-id'),
-            indice: 'Your Id',
-            valeur: id,
+            indice: libelleMenu2,
+            // AFFICHAGE = numero seul. `id` porte l'ID COMPOSE (famille-numero)
+            // et ne figure pas dans `ids` (numeros seuls) : le passer tel quel
+            // levait l'assertion Flutter « value must appear in items ».
+            valeur: valeurIdAffichee,
             elements: ids,
             surChangement: surId,
             mise: mise,
           ),
-          SizedBox(height: compactPortrait ? 10 : mise.ecartElement),
+        ] else ...[
           SelectField(
             key: const ValueKey<String>('champ-nom'),
-            indice: 'Name',
+            indice: libelleMenu2,
             valeur: nom,
             elements: noms,
             surChangement: surNom,

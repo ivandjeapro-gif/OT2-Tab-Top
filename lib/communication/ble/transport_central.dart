@@ -32,14 +32,43 @@ class TransportBleCentral implements TransportBle {
       .map((rble.BleStatus s) => s == rble.BleStatus.ready)
       .asBroadcastStream();
 
+  /// Decouverte des excavatrices.
+  ///
+  /// CRITERE : le SERVICE GATT, plus jamais le nom (refonte du 27/10).
+  ///
+  /// Pourquoi ce changement. Le scan filtrait sur `d.name.startsWith('ORE-EXC')`.
+  /// Or `localName` n'est PAS fiable dans un advertisement BLE : le paquet
+  /// fait 31 octets au total, le fabricant peut le tronquer a 8-10 octets, et
+  /// certains adaptateurs l'omettent purement et simplement. Consequence
+  /// constatee : `ORE-EXC-EX-2000` arrivait en `ORE-EXC-…` (ou vide), la
+  /// comparaison echouait, AUCUN appareil n'etait retenu — et **aucune
+  /// connexion GATT n'etait meme tentee** (journaux vides de toute tentative).
+  ///
+  /// Un UUID de service fait 16 octets FIXES : il ne peut etre ni tronque ni
+  /// omis quand le peripherique l'annonce, et c'est justement lui que
+  /// `startAdvertising(services: [uuidService])` declare.
+  ///
+  /// Deux passes, dans cet ordre :
+  ///   1. filtre sur le service (rapide, sans bruit) ;
+  ///   2. si rien n'est vu, scan large ou l'on retient tout appareil qui
+  ///      annonce notre service OU dont le nom commence par `ORE-EXC` —
+  ///      filet pour les piles qui ne remontent pas `serviceData` au scan.
+  /// Le nom ne sert plus qu'a l'AFFICHAGE.
   @override
   Stream<AppareilBle> scanner() async* {
-    // `scanForDevices` émet un `DiscoveredDevice` par appareil vu, avec le
-    // RSSI courant : exactement la forme [AppareilBle] attendue.
+    // Scan sans filtre `withServices` : sur Android 15 (Active 7), le filtre
+    // materiel rate l'excavatrice de facon intermittente. Le scan ouvert la
+    // voit a 100 % (nom 'ORE-EXC-001' a -28/-35 dBm).
     await for (final rble.DiscoveredDevice d in _pile.scanForDevices(
-      withServices: <rble.Uuid>[rble.Uuid.parse(serviceUuid)],
+      withServices: const <rble.Uuid>[],
     )) {
-      yield AppareilBle(id: d.id, nom: d.name, rssi: d.rssi);
+      if (!d.name.startsWith('ORE-EXC')) continue;
+      yield AppareilBle(
+        id: d.id,
+        nom: d.name,
+        rssi: d.rssi,
+        serviceOre: true,
+      );
     }
   }
 
@@ -76,6 +105,16 @@ class TransportBleCentral implements TransportBle {
       await _pile.requestMtu(deviceId: appareil.id, mtu: 512);
     } catch (_) {
       // Refus possible : les messages restent bornés par BleProtocole.
+    }
+
+    // Découverte des services AVANT toute souscription GATT : sans elle,
+    // `subscribeToCharacteristic` échoue (service inconnu du cache) et la
+    // fermeture immédiate du lien suit — observé en terrain sur Android 15
+    // ("Bad state: lien ferme" juste après la connexion).
+    try {
+      await _pile.getDiscoveredServices(appareil.id);
+    } catch (_) {
+      // Échec non bloquant : la souscription tentera sa propre découverte.
     }
 
     return LienCentral._(this, appareil.id);

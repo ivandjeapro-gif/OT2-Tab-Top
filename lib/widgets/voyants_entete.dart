@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
 
-import '../state/etat_couche.dart';
 import '../state/session.dart';
+import '../theme/responsive.dart';
+import 'status_badges.dart';
 
 /// Quel ensemble de voyants afficher dans le bandeau du haut.
 ///
@@ -15,161 +16,81 @@ import '../state/session.dart';
 ///   de mesures fantomes.
 enum ProfilVoyants { dt, excavatrice, spotter }
 
-/// Un voyant du bandeau : icone + libelle court, cadre de la couleur d'etat.
+/// Voyants compacts poses dans le bandeau gris du haut.
 ///
-/// Geometrie dediee au bandeau. Les badges d'ecran (`GsmStatusBadge` et
-/// compagnie) sont dessines pour 80 x 70 px : les réduire dans une boite
-/// etroite les rendait invisibles a l'ecran.
-class VoyantBandeau extends StatelessWidget {
-  const VoyantBandeau({
-    super.key,
-    required this.icone,
-    required this.couleur,
-    required this.libelle,
-    this.aide,
-    this.cote = 52,
-  });
-
-  final IconData icone;
-  final Color couleur;
-
-  /// Libelle ultra-court : ON / ... / OFF.
-  final String libelle;
-
-  /// Infobulle : dit precisement de quelle couche il s'agit.
-  final String? aide;
-
-  /// Cote du carre, en pixels logiques.
-  ///
-  /// Le bandeau vaut 96 px sur tablette, mais se reduit sur les petits
-  /// formats : 64 debordait de 18 px une fois compresse. 52 passe partout
-  /// et reste nettement plus lisible que 32.
-  final double cote;
-
-  @override
-  Widget build(BuildContext context) {
-    return Tooltip(
-      message: aide ?? libelle,
-      child: Container(
-        width: cote,
-        height: cote,
-        decoration: BoxDecoration(
-          color: Colors.white,
-          border: Border.all(color: couleur, width: 2.5),
-        ),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(icone, size: cote * 0.44, color: couleur),
-            const SizedBox(height: 1),
-            FittedBox(
-              fit: BoxFit.scaleDown,
-              child: Text(
-                libelle,
-                maxLines: 1,
-                style: TextStyle(
-                  fontSize: cote * 0.24,
-                  height: 1.0,
-                  fontWeight: FontWeight.w800,
-                  color: couleur,
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-/// Voyants poses dans le bandeau gris du haut.
+/// Ils sont volontairement petits : le bandeau mesure [MiseEnPage.hauteurEntete]
+/// et les logos occupent le centre. Un voyant doit rester lisible sans
+/// pousser le nom de l'equipement hors du cadre.
 class VoyantsEntete extends StatelessWidget {
-  const VoyantsEntete({
-    super.key,
-    required this.session,
-    required this.profil,
-  });
+  const VoyantsEntete({super.key, required this.session, required this.profil});
 
   final Session session;
   final ProfilVoyants profil;
 
-  /// Libelle court d'un etat.
-  static String _court(EtatCouche e) => switch (e) {
-        EtatCouche.connecte => 'ON',
-        EtatCouche.recherche => '...',
-        EtatCouche.arret => 'OFF',
-      };
-
   @override
   Widget build(BuildContext context) {
+    // AUCUNE taille fixe ici. Les voyants gardent leur taille de reference
+    // (`MiseEnPage.tailleBadge`, 78x66 bornee selon l'ecran), exactement comme
+    // sur les ecrans DT (`dt_screen`) et excavator (`excavator_screen`).
+    //
+    // Historique : un carre de 30 px entourait chaque badge pour le faire
+    // tenir dans le bandeau. Le `FittedBox` reduisait alors tout le contenu a
+    // environ 45 % — icone de 30 px rendue a 13 px, libelle de 13 sp rendu a
+    // 6 sp : les voyants du spotter etaient 2,6 fois plus petits que ceux des
+    // autres profils (constat du 26/10).
+    //
+    // Le bandeau mesure `hauteurEntete` (96 px) : un badge de 66 px de haut y
+    // tient sans contrainte. Le `FittedBox` est CONSERVE, mais seulement comme
+    // filet de securite : sur un ecran exceptionnellement etroit il reduit le
+    // badge au lieu de provoquer un debordement de ligne (`RenderFlex
+    // overflow`), alors qu'un `SizedBox` de taille imposee deborderait.
+    final double k = MiseEnPage.depuis(context).k;
+
+    Widget voyant(Widget badge) => FittedBox(
+      fit: BoxFit.scaleDown,
+      child: badge,
+    );
+
+    // Les voyants suivent les OPTIONS DE CONNEXION des Parametres : un
+    // transport non coche n'existe pas a l'ecran — on n'affiche ni son
+    // badge, ni un etat « inactif » qui genererait une fausse alerte.
+    // Le hotspot (de repli) n'apparait que s'il est coche ET qu'aucun
+    // transport prioritaire (BLE/XBee) ne l'ecrase — cf. demarrerCouches.
     final List<Widget> badges = switch (profil) {
+      // Ordre de lecture : ce qui sort du site, puis ce qui circule sur le
+      // site, puis la position.
       ProfilVoyants.dt => <Widget>[
-          VoyantBandeau(
-            icone: Icons.signal_cellular_alt,
-            couleur: session.etat4GAffiche.couleur,
-            libelle: _court(session.etat4GAffiche),
-            aide: '4G : liaison au serveur',
-          ),
-          VoyantBandeau(
-            icone: Icons.bluetooth,
-            couleur: session.etatBleAffiche.couleur,
-            libelle: _court(session.etatBleAffiche),
-            aide: 'BLE : lien avec l\'excavatrice',
-          ),
-          VoyantBandeau(
-            icone: Icons.wifi,
-            couleur: session.etatWifiAffiche.couleur,
-            libelle: _court(session.etatWifiAffiche),
-            aide: 'Wi-Fi : point d\'acces de l\'excavatrice',
-          ),
-          VoyantBandeau(
-            icone: Icons.satellite_alt,
-            couleur: session.etatGpsAffiche.couleur,
-            libelle: _court(session.etatGpsAffiche),
-            aide: 'GPS : source ${session.libelleSourcePosition}',
-          ),
+          voyant(GsmStatusBadge(etat: session.etat4GAffiche)),
+          if (session.transportBleActif)
+            voyant(BleStatusBadge(etat: session.etatBleAffiche)),
+          if (session.transportXbeeActif)
+            voyant(XbeeStatusBadge(etat: session.etatXbeeAffiche)),
+          if (session.transportHotspotActif && !session.transportPrioritaireActif)
+            voyant(WifiP2pStatusBadge(etat: session.etatWifiAffiche)),
+          voyant(GpsStatusBadge(etat: session.etatGpsAffiche, remplir: true)),
         ],
       ProfilVoyants.excavatrice => <Widget>[
-          VoyantBandeau(
-            icone: Icons.satellite_alt,
-            couleur: session.etatGps.couleur,
-            libelle: _court(session.etatGps),
-            aide: 'GPS : source ${session.libelleSourcePosition}',
-          ),
-          VoyantBandeau(
-            icone: Icons.wifi_tethering,
-            couleur: session.etatPointAcces.couleur,
-            libelle: _court(session.etatPointAcces),
-            aide: session.ssidExcavatrice.isEmpty
-                ? 'Point d\'acces : ferme'
-                : 'Point d\'acces : ${session.ssidExcavatrice}',
-          ),
-          VoyantBandeau(
-            icone: Icons.bluetooth,
-            couleur: session.etatBle.couleur,
-            libelle: _court(session.etatBle),
-            aide: 'BLE : lien avec les DT',
-          ),
+          voyant(GpsStatusBadge(etat: session.etatGps)),
+          if (session.transportHotspotActif && !session.transportPrioritaireActif)
+            voyant(
+              PointAccesStatusBadge(
+                etat: session.etatPointAcces,
+                ssid: session.ssidExcavatrice,
+              ),
+            ),
+          if (session.transportBleActif)
+            voyant(BleStatusBadge(etat: session.etatBle)),
+          if (session.transportXbeeActif)
+            voyant(XbeeStatusBadge(etat: session.etatXbee)),
         ],
       ProfilVoyants.spotter => <Widget>[
-          VoyantBandeau(
-            icone: Icons.signal_cellular_alt,
-            couleur: session.etat4GAffiche.couleur,
-            libelle: _court(session.etat4GAffiche),
-            aide: '4G : liaison au serveur',
-          ),
-          VoyantBandeau(
-            icone: Icons.bluetooth,
-            couleur: session.etatBleAffiche.couleur,
-            libelle: _court(session.etatBleAffiche),
-            aide: 'BLE : lien avec l\'excavatrice',
-          ),
-          VoyantBandeau(
-            icone: Icons.wifi,
-            couleur: session.etatWifiAffiche.couleur,
-            libelle: _court(session.etatWifiAffiche),
-            aide: 'Wi-Fi : point d\'acces de l\'excavatrice',
-          ),
+          voyant(GsmStatusBadge(etat: session.etat4GAffiche)),
+          if (session.transportBleActif)
+            voyant(BleStatusBadge(etat: session.etatBleAffiche)),
+          if (session.transportXbeeActif)
+            voyant(XbeeStatusBadge(etat: session.etatXbeeAffiche)),
+          if (session.transportHotspotActif && !session.transportPrioritaireActif)
+            voyant(WifiP2pStatusBadge(etat: session.etatWifiAffiche)),
         ],
     };
 
@@ -177,7 +98,9 @@ class VoyantsEntete extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       children: [
         for (int i = 0; i < badges.length; i++) ...[
-          if (i > 0) const SizedBox(width: 6),
+          // Ecart proportionnel a l'ecran : les badges etant plus larges
+          // qu'avant, 4 px les collaient les uns aux autres sur tablette.
+          if (i > 0) SizedBox(width: 8 * k),
           badges[i],
         ],
       ],

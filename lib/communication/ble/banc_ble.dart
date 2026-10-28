@@ -37,8 +37,24 @@ class BancBle {
       ..add(const AppareilBle(id: 'EXC-001', nom: 'ORE-EXC-001'));
   }
 
+  /// Dernier lien cree cote gateway (inspection de banc).
+  LienSimule? get dernierLienGateway => coteGateway._dernierLien;
+
+  /// Lien courant cote client (inspection de banc).
+  LienSimule? get dernierLienClient => coteClient._lien;
+
   /// Fait "sortir" le client de la zone : plus detectable.
   void tab3Part() => coteGateway._appareilVisible.clear();
+
+  /// L'excavatrice (emetteur) est hors de portee : le client ne la voit plus
+  /// au scan. C'est l'etat qui doit declencher une nouvelle tentative.
+  void excavatriceHorsPortee() => coteClient._gatewaysVisibles.clear();
+
+  /// L'excavatrice revient : le client la redécouvre au scan suivant.
+  void excavatriceDeRetour({String id = 'EXC-001', String nom = 'ORE-EXC-001'}) =>
+      coteClient._gatewaysVisibles
+        ..clear()
+        ..add(AppareilBle(id: id, nom: nom));
 
   /// Coupe le lien GATT en cours (obstacle, eloignement brutal).
   void couperLien() {
@@ -132,6 +148,7 @@ class LienSimule implements LienBle {
   LienSimule._pair(this._pair) : _ouvert = true;
 
   LienSimule? _pair;
+  Stream<Uint8List>? _messages;
   bool _ouvert = true;
   final StreamController<Uint8List> _reception =
       StreamController<Uint8List>.broadcast();
@@ -143,7 +160,13 @@ class LienSimule implements LienBle {
   bool get ouvert => _ouvert;
 
   @override
-  Stream<Uint8List> get messages => _reception.stream;
+  Stream<Uint8List> get messages => _messages ??= _reception.stream;
+
+  /// Abonnes en cours (inspection de banc).
+  int get abonnes => _reception.hasListener ? 1 : 0;
+
+  /// Recepteurs ayant deja consomme un flux (inspection de banc).
+  bool get recepteurs => _messages != null;
 
   /// RSSI fixe du banc, modifiable pour tester l'hysteresis.
   int rssiSimule = -55;

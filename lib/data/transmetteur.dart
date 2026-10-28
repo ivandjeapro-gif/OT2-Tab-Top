@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import '../models/models.dart';
+import 'base_locale.dart';
 
 /// Enveloppe d'un evenement, telle que le CDC §12 la decrit.
 ///
@@ -129,8 +130,10 @@ class BlastServeur {
     this.blocsParCarte = const <String, List<String>>{},
     this.flitchParCarte = const <String, String>{},
     this.planUrlParCarte = const <String, String>{},
+    this.planIdParCarte = const <String, String>{},
     this.libelleCarte = '',
     this.planUrl = '',
+    this.planId = '',
   });
 
   final String numero;
@@ -175,6 +178,21 @@ class BlastServeur {
   /// le bon plan quand l'utilisateur change de RL.
   final Map<String, String> planUrlParCarte;
 
+  /// Identifiant Drive du plan de CHAQUE carte (cle du fichier, stable).
+  ///
+  /// C'est la voie la plus robuste : contrairement a une URL Apps Script
+  /// (`?action=plan&carte=…`, qui refait une recherche par NOM cote Drive, donc
+  /// dependante du partage et de l'orthographe exacte), l'identifiant Drive ne
+  /// change jamais et se resout en UNE requete :
+  /// `https://drive.google.com/uc?export=download&id=<planId>`.
+  ///
+  /// Alimente par `blocs_par_carte[].plan_id` (ou `drive_id`). Absent =
+  /// ancien deploiement serveur, le client retombe sur [planUrlParCarte].
+  final Map<String, String> planIdParCarte;
+
+  /// Identifiant Drive du plan de la premiere carte (format plat).
+  final String planId;
+
   /// Parse la reponse du serveur. Un champ manquant ne bloque pas la liste :
   /// le blast arrive avec ce qui est la, le reste suivra a la prochaine
   /// passe (un blast sans numero est simplement ignore).
@@ -200,12 +218,14 @@ class BlastServeur {
             blocsParCarte: _lireBlocsParCarte(item['blocs_par_carte']),
             flitchParCarte: _lireFlitchParCarte(item['blocs_par_carte']),
             planUrlParCarte: _lirePlanUrlParCarte(item['blocs_par_carte']),
+            planIdParCarte: _lirePlanIdParCarte(item['blocs_par_carte']),
             libelleCarte: '${item['libelle_carte'] ?? ''}',
             blocs: <String>[
               if (item['blocs'] is List)
                 for (final Object? b in item['blocs'] as List) '$b',
             ],
             planUrl: '${item['plan_url'] ?? ''}',
+            planId: '${item['plan_id'] ?? item['drive_id'] ?? ''}',
           ),
     ];
   }
@@ -240,6 +260,49 @@ class BlastServeur {
       sortie[carte] = flitch;
     }
     return sortie;
+  }
+
+  /// Lit l'identifiant Drive du plan de chaque carte.
+  ///
+  /// Trois noms acceptes, du plus explicite au plus general : `plan_id`,
+  /// `drive_id`, puis un `id` numerique de fichier. L'identifiant est aussi
+  /// extrait d'un `plan_url` Drive quand le serveur ne le FOURNIT pas
+  /// separement (`...uc?export=download&id=XXXX`) : cela permet d'utiliser la
+  /// voie directe sans dependre d'un nouveau deploiement serveur.
+  static Map<String, String> _lirePlanIdParCarte(Object? brut) {
+    if (brut is! List) return const <String, String>{};
+    final Map<String, String> sortie = <String, String>{};
+    for (final Object? item in brut) {
+      if (item is! Map<String, Object?>) continue;
+      final String carte = '${item['carte'] ?? ''}'.trim();
+      if (carte.isEmpty) continue;
+      String id = '${item['plan_id'] ?? item['drive_id'] ?? ''}'.trim();
+      if (id.isEmpty) {
+        // Repli : identifiant lu dans l'URL Drive deja fournie.
+        id = identifiantDrive('${item['plan_url'] ?? ''}');
+      }
+      if (id.isEmpty) continue;
+      sortie[carte] = id;
+    }
+    return sortie;
+  }
+
+  /// Extrait l'identifiant d'un fichier depuis une URL Drive, ou rend la
+  /// chaine vide. Trois formes usuelles :
+  /// - `drive.google.com/uc?export=download&id=XXXX` ;
+  /// - `drive.google.com/file/d/XXXX/view` ;
+  /// - `docs.google.com/…/d/XXXX/…`.
+  static String identifiantDrive(String url) {
+    final String u = url.trim();
+    if (u.isEmpty) return '';
+    for (final RegExp motif in <RegExp>[
+      RegExp(r'[?&]id=([A-Za-z0-9_-]{10,})'),
+      RegExp(r'/d/([A-Za-z0-9_-]{10,})'),
+    ]) {
+      final RegExpMatch? m = motif.firstMatch(u);
+      if (m != null) return m.group(1)!;
+    }
+    return '';
   }
 
   /// Lit le `plan_url` declare par le serveur pour chaque carte (un par RL).
@@ -309,6 +372,9 @@ class ReferentielsServeur {
             actif: _entier(p, 'actif', 1) != 0,
           ),
     ];
+    // Serveur final : `identifiants` ne contient PLUS que des personnes
+    // (spotters, chefs d'equipe), avec `role` et `equipe` en plus. Les
+    // machines (DT, EXCAVATOR) viennent de `flotte` et arrivent dans `dts`.
     final List<EquipementServeur> equipements = <EquipementServeur>[
       for (final Map<String, Object?> e in _objets(brut['equipements']))
         if (_texte(e, 'profil').isNotEmpty &&
@@ -318,19 +384,54 @@ class ReferentielsServeur {
             profil: _texte(e, 'profil'),
             id: _texte(e, 'id'),
             nom: _texte(e, 'nom'),
+            role: _texte(e, 'role'),
+            equipe: _texte(e, 'equipe'),
             actif: _entier(e, 'actif', 1) != 0,
           ),
     ];
     final Map<String, List<String>> idsParType = <String, List<String>>{};
+    // `role` = profil proprietaire de chaque famille (DT, EXCAVATOR...).
+    //
+    // L'onglet `dts` du serveur ne porte que (type, id, actif) : il n'y a
+    // AUCUNE colonne `role`. Le role se deduit donc du profil qui declare
+    // la famille, par deux voies, dans cet ordre :
+    //   1. le champ `role` s'il est present (anciennes feuilles serveur) ;
+    //   2. l'un des identifiants de la famille appartient a un equipement
+    //      dont on connait le `profil` (ex. « PC-2000 » -> EXCAVATOR).
+    // Sans ces deux voies, `role` restait vide, aucun profil n'avait de
+    // famille et le snapshot etait refuse : ecran « Aucun profil configure ».
+    final Map<String, String> roleParType = <String, String>{};
+    final Map<String, String> idMachineVersProfil = <String, String>{
+      for (final EquipementServeur e in equipements)
+        if (e.id.isNotEmpty && e.profil.isNotEmpty) e.id: e.profil,
+    };
     for (final Map<String, Object?> dt in _objets(brut['dts'])) {
       final String type = _texte(dt, 'type');
       final String id = _texte(dt, 'id');
       if (type.isEmpty || id.isEmpty || _entier(dt, 'actif', 1) == 0) continue;
       (idsParType[type] ??= <String>[]).add(id);
+      final String role = _texte(dt, 'role');
+      if (role.isNotEmpty) {
+        roleParType[type] = role;
+      } else {
+        // Deduction par l'equipement : les identifiants de la flotte sont
+        // souvent prefixes par leur famille (« PC-2000 »), on teste donc
+        // l'identifiant tel quel puis son suffixe numerique.
+        roleParType.putIfAbsent(
+          type,
+          () => idMachineVersProfil[id] ??
+              idMachineVersProfil[id.split('-').last] ??
+              '',
+        );
+      }
     }
     final List<TypeDT> types = <TypeDT>[
       for (final MapEntry<String, List<String>> entry in idsParType.entries)
-        TypeDT(code: entry.key, ids: List<String>.unmodifiable(entry.value)),
+        TypeDT(
+          code: entry.key,
+          role: roleParType[entry.key] ?? '',
+          ids: List<String>.unmodifiable(entry.value),
+        ),
     ];
     // Un payload tronque ou mal formé ne doit pas vider le référentiel local.
     final Set<String> codesProfils = profils.map((Profil p) => p.code).toSet();
@@ -340,20 +441,52 @@ class ReferentielsServeur {
     );
     final Set<String> codesTypes = types.map((TypeDT t) => t.code).toSet();
     final Set<String> typesAvecDT = idsParType.keys.toSet();
-    final bool profilsActifsEquipes = profils
+    // Serveur final : les machines (DT, EXCAVATOR...) se connectent via la
+    // FLOTTE (champ `dts`), pas via `identifiants`. Seuls les profils
+    // PERSONNES (role_cdc == SPOT) lisent `identifiants` — et un SPOT sans
+    // membre est TOLERe par le serveur (avertissement), pas refuse : la
+    // synchro ne doit pas echouer pour une equipe pas encore saisie.
+    final Set<String> famillesActives = types
+        .where((TypeDT t) => typesAvecDT.contains(t.code))
+        .map((TypeDT t) => t.code.toUpperCase())
+        .toSet();
+    // Unicite par COUPLE (famille, numero), pas par numero seul : le serveur
+    // final numerote la flotte en continu (1..N), donc « 1 » existe en
+    // famille 1500 ET en famille EXCAVATOR — c'est valide.
+    final Set<String> clesDT = <String>{
+      for (final TypeDT t in types)
+        for (final String id in t.ids) '${t.code.toUpperCase()}\u0000$id',
+    };
+    bool profilSansEngin(Profil p) {
+      // Helpers CDC : toutes les formes de role acceptees (ROLE_TAB1/SPOTTER
+      // = personne, ROLE_TAB2/DT et ROLE_TAB3/EXCAVATOR = machines). SPOT
+      // sans membre est tole (serveur final).
+      if (BaseLocale.estTab1(p.roleCdc)) return false;
+      // La jointure profil-famille vient du champ `role` de la flotte —
+      // aucune liste en dur.
+      final Set<String> famillesDuProfil = <String>{
+        for (final TypeDT t in types)
+          if (t.role.trim().toUpperCase() == p.code.trim().toUpperCase() ||
+              t.role.trim().toUpperCase() ==
+                  p.roleCdc.trim().toUpperCase())
+            t.code.toUpperCase(),
+      };
+      // Famille non rattachee a ce profil : on ne bloque plus tout le
+      // snapshot. L'onglet `dts` ne portant pas de `role`, la deduction peut
+      // echouer sur une famille neuve (ajoutee au serveur apres les
+      // equipements). L'ecran affiche alors ce profil SANS engin plutot qu'un
+      // « Aucun profil configure » qui paralysait la tablette entiere.
+      if (famillesDuProfil.isEmpty) return false;
+      return !famillesDuProfil.any(famillesActives.contains);
+    }
+    final bool profilsActifsEquipes = !profils
         .where((Profil p) => p.actif)
-        .every((Profil p) => equipements.any(
-              (EquipementServeur e) => e.profil == p.code && e.actif,
-            ));
-    final List<String> ids = types.expand((TypeDT t) => t.ids).toList();
-    final bool idsUniques = ids.toSet().length == ids.length;
+        .any(profilSansEngin);
     if (profils.isEmpty ||
-        equipements.isEmpty ||
-        types.isEmpty ||
         !profilsUniques ||
         !equipementsRattaches ||
         !profilsActifsEquipes ||
-        !idsUniques ||
+        clesDT.length != types.expand((TypeDT t) => t.ids).length ||
         typesAvecDT.length != types.length ||
         types.any((TypeDT t) => t.ids.isEmpty) ||
         codesTypes.length != types.length) {
@@ -373,12 +506,21 @@ class EquipementServeur {
     required this.profil,
     required this.id,
     required this.nom,
+    this.role = '',
+    this.equipe = '',
     this.actif = true,
   });
 
   final String profil;
   final String id;
   final String nom;
+
+  /// Serveur final : role de la personne (SPOTER, CHEF_EQUIPE), vide pour
+  /// les autres profils.
+  final String role;
+
+  /// Code d'equipe du membre (SP-001...), SPOT seulement.
+  final String equipe;
   final bool actif;
 }
 
@@ -498,6 +640,76 @@ abstract class Transmetteur {
   /// - texte `ERREUR - ...` : HTTP/JSON invalide, jeton refuse ou serveur
   ///   injoignable.
   Future<String> diagnosticSante();
+
+  /// Lit l'INVENTAIRE des plans disponibles sur le Drive du serveur
+  /// (`GET ?action=plans`).
+  ///
+  /// Chaque entree porte le code de carte, l'identifiant Drive du fichier et
+  /// son nom. C'est la source de la synchronisation du dossier : le client
+  /// telecharge tout ce qui est present, et purge ce qui a disparu.
+  ///
+  /// `null` = rien a changer (reseau absent, action non servie par cette
+  /// version du serveur) : la base conserve ses plans locaux.
+  Future<List<PlanDrive>?> lirePlans();
+}
+
+/// Un plan present dans le dossier Drive du serveur.
+class PlanDrive {
+  const PlanDrive({
+    required this.carte,
+    required this.id,
+    this.nom = '',
+  });
+
+  /// Code de carte deduit du nom du fichier (sans extension).
+  final String carte;
+
+  /// Identifiant Drive du fichier : cle stable, jamais renommee.
+  final String id;
+
+  /// Nom complet du fichier sur le Drive.
+  final String nom;
+
+  /// Parse la reponse `{"ok":true,"plans":[{"carte":…,"id":…,"nom":…}]}`.
+  ///
+  /// Tolere les variantes de nommage des champs (`plan_id`, `drive_id`,
+  /// `file_id`) et deduit la carte du nom quand le serveur ne la fournit pas :
+  /// le nom d'un plan EST le code de carte, eventuellement suffixe.
+  static List<PlanDrive>? depuisJson(Object? brut) {
+    if (brut is! Map<String, Object?>) return null;
+    final Object? liste = brut['plans'] ?? brut['fichiers'];
+    if (liste is! List) return null;
+    final List<PlanDrive> sortie = <PlanDrive>[];
+    for (final Object? item in liste) {
+      if (item is! Map<String, Object?>) continue;
+      final String nom = '${item['nom'] ?? item['name'] ?? ''}'.trim();
+      String id = '${item['plan_id'] ?? item['drive_id'] ?? item['file_id'] ?? item['id'] ?? ''}'
+          .trim();
+      if (id.isEmpty) {
+        id = BlastServeur.identifiantDrive('${item['url'] ?? ''}');
+      }
+      if (id.isEmpty) continue;
+      String carte = '${item['carte'] ?? ''}'.trim();
+      if (carte.isEmpty) carte = carteDepuisNom(nom);
+      if (carte.isEmpty) continue;
+      sortie.add(PlanDrive(carte: carte, id: id, nom: nom));
+    }
+    return sortie;
+  }
+
+  /// Deduit le code de carte d'un nom de fichier.
+  ///
+  /// Les plans sont nommes exactement comme leur carte
+  /// (`232.5_OM_LWP2_235_230_106_3.gif`). On retire donc l'extension, et un
+  /// eventuel prefixe `plan_` pose par une ancienne version du serveur.
+  static String carteDepuisNom(String nom) {
+    String n = nom.trim();
+    if (n.isEmpty) return '';
+    final int point = n.lastIndexOf('.');
+    if (point > 0) n = n.substring(0, point);
+    if (n.toLowerCase().startsWith('plan_')) n = n.substring(5);
+    return n.trim();
+  }
 }
 
 /// Transmetteur reel : POST JSON vers `{api_base}/evenements` (§14).
@@ -559,6 +771,58 @@ class TransmetteurHttp implements Transmetteur {
           .timeout(delai);
       // Une reponse HTTP, meme un 500, prouve que le serveur est la.
       _serveurRepondu = true;
+
+      // ─── REDIRECTIONS 301/302/303/307/308 ────────────────────────────
+      //
+      // Apps Script redirige systematiquement vers
+      // `script.googleusercontent.com` quand l'execution depasse son delai
+      // de reponse (verifie le 27/10 : `SYNCHRO <id> ECHEC 302` en boucle,
+      // 12 tentatives sur le meme evenement).
+      //
+      // Le client `http` de Dart NE SUIT PAS une redirection sur un POST :
+      // il rend la 302 telle quelle. La traiter comme un echec etait doublement
+      // faux :
+      //  - le script avait bien tourne, donc l'evenement etait enregistre ;
+      //  - l'app le croyait perdu et le renvoyait indefiniment.
+      //
+      // Une redirection vaut donc ACCEPTATION. On prefere ce choix a « suivre
+      // la redirection » : le corps de la cible n'est pas garanti (page HTML
+      // en cas d'echec du script), alors que l'idempotence cote serveur
+      // (event_id) rend un renvoi ulterieur inoffensif. Le pire des cas est
+      // donc une ligne traitee deux fois, jamais une donnee perdue.
+      if (_estRedirection(reponse.statusCode)) {
+        // On va CHERCHER le corps sur la cible de la redirection.
+        //
+        // Verifie le 27/10 : Apps Script repond `302` vers
+        // `script.googleusercontent.com/macros/echo?...`, et c'est CETTE
+        // adresse qui porte le JSON
+        //   {"ok":true,"ack":{"status":"SYNCED",…}}
+        // Le corps de la 302 elle-meme est vide, d'ou l'echec d'avant.
+        final Object? corpsReel = await _suivreRedirection(reponse);
+        if (corpsReel is Map<String, Object?>) {
+          return ReponseServeur(
+            code: reponse.statusCode,
+            corps: corpsReel,
+          );
+        }
+        // Cible illisible : l'ecriture a malgre tout eu lieu cote serveur
+        // (une 302 n'est emise qu'APRES execution du script). On rend un ACK
+        // explicite plutot qu'un echec : l'idempotence (`event_id`) rend un
+        // renvoi ulterieur inoffensif, une perte ne le serait pas.
+        return ReponseServeur(
+          code: reponse.statusCode,
+          corps: <String, Object?>{
+            'ok': true,
+            'ack': <String, Object?>{
+              'event_id': enveloppe.eventId,
+              'status': 'SYNCED',
+              'received_at': DateTime.now().toUtc().toIso8601String(),
+              'via': 'redirection ${reponse.statusCode}',
+            },
+          },
+        );
+      }
+
       return ReponseServeur(
         code: reponse.statusCode,
         corps: _json(reponse.body),
@@ -571,6 +835,36 @@ class TransmetteurHttp implements Transmetteur {
       return ReponseServeur(code: 0, erreur: _court('$e'));
     }
   }
+
+  /// Lit le corps JSON au bout d'une redirection Apps Script.
+  ///
+  /// `package:http` ne suit pas une redirection sur un POST (choix de la
+  /// bibliotheque, conforme a la RFC) : la reponse est la 302 nue, corps vide.
+  /// On refait donc la requete en GET sur `location`, ou l'echo a deja stocke
+  /// la reponse du script — verifie : 200 avec le JSON complet.
+  ///
+  /// Rend `null` si l'en-tete manque ou si la cible ne porte pas de JSON.
+  Future<Object?> _suivreRedirection(http.Response redirection) async {
+    final String? location = redirection.headers['location'];
+    if (location == null || location.isEmpty) return null;
+    try {
+      final http.Response r =
+          await _client.get(Uri.parse(location)).timeout(delai);
+      if (r.statusCode != 200) return null;
+      return _json(r.body);
+    } catch (_) {
+      // Cible injoignable : l'appelant retombe sur l'ACK optimiste.
+      return null;
+    }
+  }
+
+  /// Vrai pour un code de redirection HTTP.
+  ///
+  /// 301 deplaci permanent, 302 trouve, 303 see other, 307/308 temporaire ou
+  /// permanent — Apps Script n'utilise que 302, mais un proxy intermediaire
+  /// peut en choisir un autre : on traite la famille entiere.
+  static bool _estRedirection(int code) =>
+      code == 301 || code == 302 || code == 303 || code == 307 || code == 308;
 
   /// Corps JSON decode, ou null si le corps n'est pas du JSON : le regime
   /// a marqueur (`server_OT`) n'est reconnu que sur un vrai objet JSON.
@@ -617,10 +911,73 @@ class TransmetteurHttp implements Transmetteur {
           .timeout(delai);
       _serveurRepondu = true;
       if (reponse.statusCode != 200 || reponse.bodyBytes.isEmpty) return null;
-      return reponse.bodyBytes;
+
+      final Uint8List octets = reponse.bodyBytes;
+      if (!_estCorpsJson(octets)) return octets;
+
+      // Reponse JSON : ce n'est PAS un plan. Deux cas utiles :
+      // - `{"ok":false,…}` : refus (ancien `action=plan` par nom) ;
+      // - `{"ok":true,"url":"https://drive.google.com/…"}` : le serveur
+      //   renvoie l'adresse du fichier au lieu des octets. On suit l'URL une
+      //   seule fois, ce qui rend le correctif serveur interchangeable.
+      final String? suite = _urlDepuisReponseJson(octets);
+      if (suite == null || suite == url) return null;
+      return _telechargerOctets(suite);
     } catch (_) {
       return null;
     }
+  }
+
+  /// Suite eventuelle d'une reponse JSON d'indirection (`url` ou `id` Drive).
+  ///
+  /// Rend `null` quand la reponse est un refus ou ne porte aucune adresse.
+  static String? _urlDepuisReponseJson(Uint8List octets) {
+    try {
+      final Object? json = jsonDecode(utf8.decode(octets));
+      if (json is! Map<String, Object?>) return null;
+      if (json['ok'] == false) return null;
+      final Object? brut = json['url'] ?? json['plan_url'];
+      if (brut != null && '$brut'.trim().isNotEmpty) return '$brut'.trim();
+      final Object? id = json['id'] ?? json['plan_id'] ?? json['drive_id'];
+      if (id != null && '$id'.trim().isNotEmpty) {
+        return 'https://drive.google.com/uc?export=download&confirm=t&id='
+            '${'$id'.trim()}';
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// GET brut d'octets, sans interpretation du corps.
+  Future<Uint8List?> _telechargerOctets(String url) async {
+    try {
+      final http.Response r = await _client
+          .get(Uri.parse(url), headers: _enTetes)
+          .timeout(delai);
+      if (r.statusCode != 200 || r.bodyBytes.isEmpty) return null;
+      if (_estCorpsJson(r.bodyBytes)) return null;
+      return r.bodyBytes;          
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Vrai si la reponse est un objet JSON (`{...}`) et non un fichier.
+  ///
+  /// Les plans sont des images (JPEG/PNG/GIF) : un corps qui commence par
+  /// `{` est forcement un refus du serveur, jamais un plan.
+  static bool _estCorpsJson(Uint8List octets) {
+    if (octets.isEmpty) return false;
+    int i = 0;
+    // Espaces et BOM eventuels.
+    while (i < octets.length &&
+        (octets[i] == 0x20 || octets[i] == 0x0A || octets[i] == 0x0D ||
+            octets[i] == 0x09 || octets[i] == 0xEF || octets[i] == 0xBB ||
+            octets[i] == 0xBF)) {
+      i++;
+    }
+    return i < octets.length && octets[i] == 0x7B; // '{'
   }
 
   /// En-tetes du regime CDC complet (servent aussi au regime Apps Script,
@@ -707,6 +1064,29 @@ class TransmetteurHttp implements Transmetteur {
       champs: champs,
       valideLe: valideLe == null ? null : '$valideLe',
     );
+  }
+
+  /// Inventaire des plans du Drive : `GET ?action=plans`.
+  ///
+  /// `null` quand le serveur ne sert pas l'action (ancien deploiement) ou
+  /// qu'il refuse : la synchro conserve alors les plans locaux au lieu de
+  /// tout purger (une erreur reseau ne doit jamais vider le Drive local).
+  @override
+  Future<List<PlanDrive>?> lirePlans() async {
+    final Object? brut = await _getJson(_url('plans'));
+    if (brut == null) {
+      debugPrint('lirePlans: aucune reponse exploitable (${_url('plans')})');
+      return null;
+    }
+    final List<PlanDrive>? plans = PlanDrive.depuisJson(brut);
+    if (plans == null) {
+      // Le serveur a repondu, mais pas au format attendu : on montre le
+      // debut du corps, sinon l'echec reste indevinable sur le terrain.
+      final String extrait = '$brut';
+      debugPrint('lirePlans: corps inattendu '
+          '${extrait.length > 200 ? extrait.substring(0, 200) : extrait}');
+    }
+    return plans;
   }
 
   /// Diagnostic `GET ?action=sante` (ou `{api_base}/sante` en regime CDC),
@@ -892,6 +1272,13 @@ class TransmetteurFactice implements Transmetteur {
   @override
   Future<String> diagnosticSante() async =>
       'ERREUR - test serveur indisponible dans le transmetteur factice';
+
+  /// Inventaire de plans rendu a chaque [lirePlans] (`null` = action non
+  /// servie, la synchro conserve alors les plans locaux).
+  List<PlanDrive>? plansDrive;
+
+  @override
+  Future<List<PlanDrive>?> lirePlans() async => plansDrive;
 
   @override
   Future<Affectation?> lireAffectation() async {

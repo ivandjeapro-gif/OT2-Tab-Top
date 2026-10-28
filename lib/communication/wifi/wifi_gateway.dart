@@ -261,10 +261,22 @@ class WifiClient {
   final Duration delaiReconnexion;
 
   LienWifi? _lien;
+
+  /// Adresse du serveur de l'excavatrice (memorisee au premier `connecter`
+  /// avec `adresseImposee`) : la reconnexion automatique la reutilise.
+  String _adresseServeur = '';
+
   StreamSubscription<Uint8List>? _sub;
   Timer? _minuterieReconnexion;
   bool _authentifie = false;
   bool _arrete = false;
+
+  /// Flux de messages du lien courant, mémorisé : `TransportWifi` le type en
+  /// `Stream<Uint8List>` alors que le transport TCP expose un stream à type
+  /// large. Se réabonner via le getter rétrécirait/resouscrirait à côté ;
+  /// garder la même référence est ce qui rend l'abonnement post-handshake
+  /// sûr (même leçon que le BLE).
+  Stream<Uint8List>? _messages;
 
   /// File locale des événements non acquittés (CDC §16.1).
   final List<Map<String, Object?>> fileAttente = <Map<String, Object?>>[];
@@ -296,15 +308,23 @@ class WifiClient {
     String? adresseImposee,
   }) async {
     if (_arrete) return false;
+    // L'adresse est MÉMORISÉE : la reconnexion automatique (`_surveiller`)
+    // appelle `connecter()` sans argument — sans cette mémo, chaque cycle de
+    // reconnexion repartait en scan d'un SSID `ORE-EXC` qui n'existe pas
+    // (le partage système s'appelle `AndroidShare_xxx`) et le badge restait
+    // « offline » malgré un réseau sain (observé le 21/10).
+    if (adresseImposee != null && adresseImposee.isNotEmpty) {
+      _adresseServeur = adresseImposee;
+    }
     ReseauWifi? cible;
     // Adresse fournie par le provisionnement BLE : le point d'acces Android
     // porte un SSID aleatoire (`AndroidShare_7741`), donc on ne peut pas le
     // reconnaitre a son nom. L'excavatrice annonce son IP, on l'utilise
     // directement et le scan devient inutile.
-    if (adresseImposee != null && adresseImposee.isNotEmpty) {
+    if (_adresseServeur.isNotEmpty) {
       cible = ReseauWifi(
         ssid: 'ORE-EXC',
-        adresse: adresseImposee,
+        adresse: _adresseServeur,
         puissance: 0,
       );
     }
@@ -328,6 +348,7 @@ class WifiClient {
     }
     // Abonnement AVANT le handshake (même pattern que le BLE, déjà observe).
     final Stream<Uint8List> messages = _lien!.messages;
+    _messages = messages;
     final Completer<bool> verdict = Completer<bool>();
     StreamSubscription<Uint8List>? subHandshake;
     subHandshake = messages.listen(
@@ -359,12 +380,22 @@ class WifiClient {
       }
     } catch (e) {
       _journal.ligne('Wi-Fi handshake echoue : $e');
+      // Sans nettoyage, `_lien` restait renseigné et la tentative suivante
+      // réutilisait un lien mort.
+      await _lien?.fermer();
+      _lien = null;
       return false;
     } finally {
       await subHandshake.cancel();
     }
     _authentifie = true;
-    _sub = messages.listen(_traiterMessage);
+    _sub = (_messages ?? messages).listen(
+      _traiterMessage,
+      // Lien tombé en cours de session : on abandonne proprement, la
+      // surveillance (`_surveiller`) rouvrira un lien neuf.
+      onDone: _lienPerdu,
+      onError: (Object _) => _lienPerdu(),
+    );
     _journal.ligne('Wi-Fi $sourceDevice authentifie par TAB 2');
     // Retransmission de la file en attente (CDC §16.1, REQ-008).
     for (final Map<String, Object?> e in List<Map<String, Object?>>.of(
@@ -372,6 +403,16 @@ class WifiClient {
       await envoyer(e);
     }
     return true;
+  }
+
+  /// Le lien est tombé : on oublie l'état authentifié pour que `connecte`
+  /// redevienne faux et que `_surveiller` rouvre un lien neuf. La file
+  /// [fileAttente] est conservée et repartira à la prochaine authentification.
+  void _lienPerdu() {
+    if (!_authentifie && _lien == null) return;
+    _authentifie = false;
+    _lien = null;
+    _journal.ligne('Wi-Fi lien perdu avec $sourceDevice - file conservee');
   }
 
   /// Active la reconnexion automatique (REQ-008) : surveille le lien et
@@ -401,7 +442,8 @@ class WifiClient {
     _lien = lien;
     _authentifie = true;
     await _sub?.cancel();
-    _sub = lien.messages.listen(_traiterMessage);
+    _messages ??= lien.messages;
+    _sub = (_messages ?? lien.messages).listen(_traiterMessage);
     await envoyer(evenement);
   }
 

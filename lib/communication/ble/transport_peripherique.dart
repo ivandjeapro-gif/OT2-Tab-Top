@@ -1,7 +1,6 @@
 import 'dart:async';
-import 'dart:typed_data';
-
 import 'package:ble_peripheral/ble_peripheral.dart' as periph;
+import 'package:flutter/foundation.dart';
 
 import 'transport_ble.dart';
 
@@ -25,13 +24,21 @@ import 'transport_ble.dart';
 ///   pile Android, que le handshake complete par l'id applicatif.
 class TransportBlePeripherique implements TransportBle {
   TransportBlePeripherique({
-    // Inversion des roles (Voie 1) : c'est l'EXCAVATRICE qui emet, les DT
-    // s'y accrochent. Le nom annonce distingue donc l'emetteur.
+    // Nom d'advertising FIXE et STANDARD : 'ORE-EXC-001'.
+    //
+    // Constat du 27/10 : personnaliser ce nom ('ORE-EXC-HYUNDAI-32') cassait
+    // l'advertising sur Android (nom trop long dans le paquet de 31 octets,
+    // rejete ou tronque par la pile) et le scan des DT ne trouvait plus rien.
+    // L'identite REELLE de l'engin (ex. HYUNDAI-32) voyage dans le HANDSHAKE
+    // applicatif (`source_device`), pas dans le nom radio.
     this.nomPublic = 'ORE-EXC-001',
     this.serviceUuid = uuidService,
     this.caracteristiqueRx = uuidCaracteristiqueRx,
     this.caracteristiqueTx = uuidCaracteristiqueTx,
   });
+
+  /// Nom d'advertising fixe annonce par toute excavatrice.
+  static String nomAdvertise(String _) => 'ORE-EXC-001';
 
   /// UUID du service ORE TRACKING (arbitraire mais fixe : les deux côtés
   /// doivent convenir des mêmes).
@@ -109,7 +116,14 @@ class TransportBlePeripherique implements TransportBle {
         int offset,
         Uint8List? valeur,
       ) {
-        if (characteristicId != caracteristiqueRx || valeur == null) {
+        debugPrint('OREBLE rx ${valeur?.length} octets sur '
+            '$characteristicId de $deviceId');
+        // Le plugin renvoie l'UUID en majuscules (`0000FE5B-...`) alors que
+        // les constantes sont en minuscules : comparer sans la casse, sinon
+        // l'ecriture du client est jetee et le gateway repond "pas de
+        // handshake" (observe en terrain, 21/10).
+        if (valeur == null ||
+            characteristicId.toLowerCase() != caracteristiqueRx) {
           return null;
         }
         _livrer(deviceId, valeur);
@@ -128,6 +142,13 @@ class TransportBlePeripherique implements TransportBle {
   /// Démarre l'advertising : c'est ce qui rend TAB 2 visible des TAB 3.
   Future<void> demarrerPublicite() async {
     await preparer();
+    // Le paquet BLE legacy (1M PHY) est strictement limite a 31 octets.
+    // L'UUID 128 bits prend deja 18 octets (1 len + 1 type + 16 data),
+    // les flags prennent 3 octets -> il ne reste que 10 octets !
+    // Si on ajoute des manufacturerData en plus, le paquet depasse 31 octets
+    // et Android renvoie ADVERTISE_FAILED_DATA_TOO_LARGE en silence.
+    // On ne met donc QUE le serviceUuid et le localName : c'est ce qui
+    // garantit que l'advertising demarre toujours sans erreur.
     await periph.BlePeripheral.startAdvertising(
       services: <String>[serviceUuid],
       localName: nomPublic,
@@ -139,7 +160,12 @@ class TransportBlePeripherique implements TransportBle {
 
   void _livrer(String deviceId, Uint8List octets) {
     // Un message du client crée le lien s'il n'existe pas encore : le
-    // gateway s'abonne à `liensEntrants()` et déroule son handshake dessus.
+    // gateway s'abonne à `liensEntrants()` puis à `lien.messages` — avec un
+    // délai de quelques microtâches entre les deux. Le premier message (le
+    // handshake) peut donc arriver PENDANT ce délai : ajouté à un stream
+    // broadcast sans rétention, il était perdu et le gateway répondait
+    // « pas de handshake » (observé en terrain : 92 octets reçus par le
+    // callback natif, jamais livrés au gateway).
     final LienPeripherique lien = _liens.putIfAbsent(
       deviceId,
       () {
@@ -189,12 +215,26 @@ class TransportBlePeripherique implements TransportBle {
 
 /// Lien GATT côté TAB 2, vu par le gateway comme un [LienBle] ordinaire.
 class LienPeripherique implements LienBle, LienDeclaratif {
-  LienPeripherique._(this._transport, this._deviceId);
+  LienPeripherique._(this._transport, this._deviceId) {
+    // Au premier listen (le gateway, quelques microtaches apres la creation
+    // du lien), on rejoue ce qui est arrive entre-temps : sans cela le
+    // handshake envoye immediatement apres la connexion etait perdu (stream
+    // broadcast = aucune retention).
+    _reception = StreamController<Uint8List>.broadcast(
+      onListen: () {
+        if (_enAttente.isEmpty) return;
+        final List<Uint8List> aRejouer = List<Uint8List>.of(_enAttente);
+        _enAttente.clear();
+        for (final Uint8List o in aRejouer) {
+          _reception.add(o);
+        }
+      },
+    );
+  }
 
   final TransportBlePeripherique _transport;
   final String _deviceId;
-  final StreamController<Uint8List> _reception =
-      StreamController<Uint8List>.broadcast();
+  late final StreamController<Uint8List> _reception;
   bool _ouvert = true;
 
   /// RSSI déclaré par le client dans son handshake (null tant qu'il n'a pas
@@ -231,6 +271,19 @@ class LienPeripherique implements LienBle, LienDeclaratif {
 
   void _recevoir(Uint8List octets) {
     if (!_ouvert) return;
+    // Rétention : tant que personne n'écoute (le gateway s'abonne à
+    // `liensEntrants` PUIS à `messages`, avec un délai entre les deux), le
+    // message est mis en attente au lieu d'être perdu. Un stream broadcast
+    // ne garde rien ; le handshake envoyé immédiatement après la connexion
+    // arrivait donc sur un flux sans auditeur.
+    if (!_reception.hasListener) {
+      _enAttente.add(octets);
+      return;
+    }
     _reception.add(octets);
   }
+
+  /// Messages recus avant tout abonnement (course
+  /// `_livrer`/`_accueilLien`), rejoués au premier listen.
+  final List<Uint8List> _enAttente = <Uint8List>[];
 }

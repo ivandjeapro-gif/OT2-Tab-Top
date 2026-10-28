@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-
+import '../data/base_locale.dart';
 import '../state/etat_couche.dart';
 import '../state/session.dart';
 import '../theme/app_theme.dart';
@@ -39,6 +39,21 @@ class SupervisionReseau extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final double k = MiseEnPage.depuis(context).k;
+
+    // LA FENETRE ECOUTE LA SESSION.
+    //
+    // Bug corrige le 27/10 : le journal etait bien ecrit (verifie en base :
+    // « BLE gateway demarre », « BLE 1500-3 RSSI -54 », « BLE 1500-3
+    // connecte »), mais ce panneau le lisait UNE FOIS a l'ouverture et ne se
+    // reconstruisait plus. L'operateur voyait donc « Aucun evenement reseau
+    // journalise » alors que le flux fonctionnait — le pire des diagnostics.
+    return ListenableBuilder(
+      listenable: session,
+      builder: (context, _) => _contenu(context, k),
+    );
+  }
+
+  Widget _contenu(BuildContext context, double k) {
     final List<String> journal = session.base.journalBle;
 
     return Padding(
@@ -70,26 +85,45 @@ class SupervisionReseau extends StatelessWidget {
             spacing: 10 * k,
             runSpacing: 8 * k,
             children: [
-              _Etiquette(
-                k: k,
-                icone: Icons.bluetooth,
-                etat: session.etatBle,
-                texte: session.bleActif
-                    ? (session.liensBle > 0
-                        ? 'BLE : ${session.liensBle} excavatrice(s) connectée(s)'
-                        : 'BLE : actif, aucune excavatrice')
-                    : 'BLE : inactif',
-              ),
-              _Etiquette(
-                k: k,
-                icone: Icons.wifi,
-                etat: session.etatWifiP2p,
-                texte: session.wifiActif
-                    ? (session.liensWifi > 0
-                        ? 'Wi-Fi : ${session.liensWifi} spotter(s) connecté(s)'
-                        : 'Wi-Fi : actif, aucun spotter')
-                    : 'Wi-Fi : inactif',
-              ),
+              // On n'affiche QUE les transports cochés dans les Paramètres :
+              // un mode désactivé n'existe pas pour l'utilisateur, il ne
+              // génère ni étiquette « inactif » ni fausse alerte.
+              if (session.transportBleActif)
+                _Etiquette(
+                  k: k,
+                  icone: Icons.bluetooth,
+                  etat: session.etatBle,
+                  texte: session.bleActif
+                      ? (session.liensBle > 0
+                          // Le libelle depend du ROLE LOCAL : une excavatrice
+                          // recoit des DT, un DT voit une excavatrice. Le meme
+                          // compteur liait les deux et affichait « 1 excavatrice
+                          // connectee » DANS L'EXCAVATRICE elle-meme.
+                          ? 'BLE : ${session.liensBle} ${_nomPair(session)} connecté(s)'
+                          : 'BLE : actif, aucun ${_nomPair(session)}')
+                      : 'BLE : inactif',
+                ),
+              // XBee : meme regle que partout ailleurs — un transport
+              // decoche n'existe pas a l'ecran. Ce panneau l'omettait alors
+              // que l'entete du DT et la section Parametres le proposent,
+              // si bien qu'un XBee en panne n'etait visible nulle part.
+              if (session.transportXbeeActif)
+                _Etiquette(
+                  k: k,
+                  icone: Icons.settings_input_antenna,
+                  etat: session.etatXbee,
+                  texte: session.xbeeActif
+                      ? 'XBee : ${session.etatXbee.libelle}'
+                      : 'XBee : inactif',
+                ),
+              if (session.transportHotspotActif &&
+                  !session.transportPrioritaireActif)
+                _Etiquette(
+                  k: k,
+                  icone: Icons.wifi,
+                  etat: session.etatWifiP2p,
+                  texte: _texteWifi(session),
+                ),
               _Etiquette(
                 k: k,
                 icone: Icons.cloud_upload_outlined,
@@ -159,6 +193,66 @@ class SupervisionReseau extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  /// Nom du pair vu par L'APPAREIL LOCAL, pour les libelles BLE.
+  ///
+  /// Une excavatrice recoit des DT ; un DT (ou un spotter) voit une
+  /// excavatrice. Le texte etait figé sur « excavatrice » : l'excavatrice
+  /// annoncait « 1 excavatrice connectee » en parlant d'elle-meme — elle doit
+  /// dire « 1 DT connecte ».
+  static String _nomPair(Session session) {
+    final String role =
+        (session.profile?.roleCdc ?? '').trim().toUpperCase();
+    final bool localEstExcavatrice =
+        BaseLocale.estTab3(role) || role == 'EXCAVATOR';
+    return localEstExcavatrice ? 'DT' : 'excavatrice';
+  }
+
+  /// Texte du badge Wi-Fi, NOMINATIF (option B).
+  ///
+  /// Le Wi-Fi est un bus PARTAGE : une excavatrice recoit des DT **et** des
+  /// spotters. Un libelle au singulier (« aucun DT ») mentait quand un
+  /// spotter etait present, et inversement. Cote client, on nomme le serveur
+  /// (l'excavatrice) ou on signale l'absence de lien.
+  static String _texteWifi(Session session) {
+    if (!session.wifiActif) return 'Wi-Fi : inactif';
+    final Map<String, int> parRole = session.wifiParRole;
+    if (parRole.isEmpty) {
+      if (session.liensWifi > 0) {
+        return 'Wi-Fi : ${session.liensWifi} client(s) connecte(s)';
+      }
+      return _localEstExcavatrice(session)
+          ? 'Wi-Fi : actif, aucun client'
+          : 'Wi-Fi : actif, non connecte a l\'excavatrice';
+    }
+    // Repartition nominative, ordre stable : DT, SPOT, puis le reste.
+    final List<String> morceaux = <String>[];
+    for (final String role in <String>['DT', 'SPOT', 'EXCAVATOR']) {
+      final int n = parRole[role] ?? 0;
+      if (n == 0) continue;
+      morceaux.add('$n ${_nomRole(role)}');
+    }
+    for (final MapEntry<String, int> e in parRole.entries) {
+      if (<String>['DT', 'SPOT', 'EXCAVATOR'].contains(e.key)) continue;
+      morceaux.add('${e.value} ${_nomRole(e.key)}');
+    }
+    return 'Wi-Fi : ${morceaux.join(', ')} connecte(s)';
+  }
+
+  /// Libelle court d'un role recu au handshake.
+  static String _nomRole(String role) {
+    final String r = role.trim().toUpperCase();
+    if (r.contains('SPOT')) return r == 'SPOT' ? 'spotter' : 'spotters';
+    if (r == 'DT' || r.contains('TAB2')) return 'DT';
+    if (r.contains('EXCAVATOR') || r.contains('TAB3')) return 'excavatrice';
+    return 'client';
+  }
+
+  /// Vrai si la tablette courante est l'excavatrice (elle sert le reseau).
+  static bool _localEstExcavatrice(Session session) {
+    final String role = (session.profile?.roleCdc ?? '').trim().toUpperCase();
+    return BaseLocale.estTab3(role) || role == 'EXCAVATOR';
   }
 
   static String _heure(DateTime moment) {

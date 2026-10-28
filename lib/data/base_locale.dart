@@ -6,6 +6,9 @@ import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 
 import '../models/models.dart';
+import '../communication/ble/ble_protocole.dart';
+import '../communication/ble/ble_gateway.dart' show JournalBle;
+import '../communication/wifi/wifi_gateway.dart' show JournalWifi;
 import '../communication/position/service_position.dart';
 import 'transmetteur.dart';
 
@@ -28,14 +31,21 @@ import 'transmetteur.dart';
 /// - `evenements`  : file PENDING / SENDING / SYNCED (REQ-014, §14)
 /// - `affectation` : destination / dumping area choisies par le serveur
 class BaseLocale {
-  /// Constructeur public : trivial, delegue immediatement a [_production] pour
-  /// les valeurs reelles. Le parametre `blasts` reste inject able uniquement
-  /// pour les tests : en production, [blastsDemo] n'est JAMAIS appele (sa
-  /// signature est `@visibleForTesting`) et la liste par defaut est vide.
+  /// Constructeur public : valeurs reelles vides en production, injectees par
+  /// le snapshot serveur a la premiere synchronisation. Le parametre `blasts`
+  /// reste injectable uniquement pour les tests : en production [blastsDemo]
+  /// n'est JAMAIS appele.
   ///
   /// La liste par defaut doit rester **modifiable** : [_recharger] la vide et
   /// la recharge depuis le disque (`const []` planterait sur `clear()`).
-  BaseLocale({List<Blast>? blasts}) : this._production(blasts: blasts);
+  BaseLocale({List<Blast>? blasts})
+      : _typesDT = <TypeDT>[],
+        _carteLabel = _carteLabelsInit(),
+        _positions = _positionsInit(),
+        _equipements = <String, List<({String id, String nom, String equipe})>>{},
+        blasts = blasts ?? <Blast>[] {
+    _instances.add(this);
+  }
 
   /// Constructeur prive : definit les valeurs reelles (vides en production,
   /// injectees par le snapshot serveur a la premiere synchronisation). Les
@@ -46,13 +56,6 @@ class BaseLocale {
   /// Toute nouvelle initialisation doit arriver ICI et nulle part ailleurs :
   /// la separation constructeur / seeds garantit qu'aucune constante de demo
   /// ne peut fuiter dans la base reelle.
-  BaseLocale._production({List<Blast>? blasts})
-      : _typesDT = <TypeDT>[],
-        _carteLabel = _carteLabelsInit(),
-        _positions = _positionsInit(),
-        _equipements = <String, List<({String id, String nom})>>{},
-        blasts = blasts ?? <Blast>[];
-
   /// Version du modele de donnees (CDC §23). Toute evolution du schema passe
   /// par une incrementation ici : [openDatabase] declenche alors [_versionner].
   ///
@@ -71,7 +74,7 @@ class BaseLocale {
   ///   bureau y depose des messages que le spotter lit au prochain poll) ;
   /// - v8 : les referentiels profils, equipements et familles/DT sont servis
   ///   par le serveur et remplacent leurs valeurs locales.
-  static const int versionModele = 8;
+  static const int versionModele = 9;
 
   /// Roles CDC (REQ-002) : les trois valeurs possibles a l'enrolement.
   static const String roleTab1 = 'ROLE_TAB1';
@@ -105,14 +108,25 @@ class BaseLocale {
   /// d'attente affiche des evenements que l'utilisateur n'a jamais crees.
   static bool estSpotter(String role) {
     final String r = role.toUpperCase();
-    return r == 'SPOTTER' || r == 'SPOT';
+    // ROLE_TAB1 : forme CDC historique (tests et profils deja enroles).
+    // SPOTTER/SPOT : formes cote sheet.
+    return r == 'ROLE_TAB1' || r == 'SPOTTER' || r == 'SPOT';
+  }
+
+  /// Nom d'affichage d'un engin de flotte : `PROFIL numero(2 chiffres) -
+  /// famille`, ex. « DT 05 - 1500 ». Le numero est padde pour rester
+  /// aligne (05, 12). C'est le nom montre dans le titre de session.
+  static String nomEngin(String profil, String numero, String famille) {
+    final String n = numero.trim();
+    final String numero2 = n.length == 1 ? '0$n' : n;
+    return '${profil.trim().toUpperCase()} $numero2 - ${famille.trim().toUpperCase()}';
   }
 
   /// Versions visibles par l'application, ecrites dans `meta` a la creation.
   static const Map<String, String> versions = <String, String>{
     'vers_app': '1.0.0',
     'vers_protocole': '1.0',
-    'vers_modele': '8.0',
+    'vers_modele': '9.0',
   };
 
   /// Modes d'envoi du bouton « Envoyer », choisis dans `meta.envoi_mode`
@@ -170,7 +184,9 @@ class BaseLocale {
   /// alimentes par la meme source et ne peuvent pas proposer une paire
   /// inexistante. La cle est le code du profil, sa colonne `role` porte le
   /// role CDC de la meme ligne.
-  final Map<String, List<({String id, String nom})>> _equipements;
+  /// Serveur final : les personnes (SPOT) portent leur equipe ; le login
+  /// spotter propose Equipe puis Nom. Enregistre comme `equipe\u0000nom`.
+  final Map<String, List<({String id, String nom, String equipe})>> _equipements;
 
   /// Profils proposes au login (CDC §2.3), lus depuis le dernier snapshot
   /// serveur validé. Vide tant qu'aucun snapshot n'a été reçu.
@@ -292,6 +308,7 @@ class BaseLocale {
         profil TEXT NOT NULL DEFAULT '',
         id TEXT NOT NULL,
         nom TEXT NOT NULL DEFAULT '',
+        equipe TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (role, id)
       )
     ''');
@@ -310,7 +327,8 @@ class BaseLocale {
     ''');
     await db.execute('''
       CREATE TABLE types_dt (
-        code TEXT NOT NULL PRIMARY KEY
+        code TEXT NOT NULL PRIMARY KEY,
+        role TEXT NOT NULL DEFAULT ''
       )
     ''');
     await db.execute('''
@@ -375,6 +393,21 @@ class BaseLocale {
       )
     ''');
     await db.execute('CREATE INDEX idx_evenements_etat ON evenements (etat)');
+    // Marqueur de relais local (v8) : distinct de `etat` (qui porte la synchro
+    // serveur 4G). Un evenement relaye au DT via BLE/Wi-Fi garde son etat
+    // PENDING pour le serveur, mais ne doit plus repartir par le relais —
+    // sinon la boucle de relais renvoyait indefiniment les memes lignes
+    // (UNIQUE constraint en cascade sur le DT, observe le 21/10).
+    try {
+      await db.execute(
+        'ALTER TABLE evenements ADD COLUMN relaye INTEGER NOT NULL DEFAULT 0',
+      );
+    } catch (_) {} // deja presente : base existante.
+    try {
+      await db.execute(
+        'CREATE INDEX idx_evenements_relaye ON evenements (relaye)',
+      );
+    } catch (_) {}
     // Destination et dumping area : paires cle/valeur fournies par le
     // serveur. La table garde l'horodatage de validation pour l'ecran.
     await db.execute(_tableAffectation);
@@ -523,13 +556,74 @@ class BaseLocale {
       );
     }
     if (de < 8) {
-      // v8 : les listes de reference sont resynchronisees depuis le serveur;
-      // les structures locales restent compatibles, sans migration destructive.
+      // v8 : la table `equipements` porte la colonne `equipe` (serveur final :
+      // chaque membre d'equipe de spotter est rattache a son groupe SP-xxx).
+      // Garde-fou PRAGMA : une base deja porteuse ne doit pas planter sur un
+      // ADD COLUMN duplique.
+      final List<Map<String, Object?>> colsEq = await db.rawQuery(
+        'PRAGMA table_info(equipements)',
+      );
+      if (!colsEq.any((row) => row['name'] == 'equipe')) {
+        await db.execute(
+          "ALTER TABLE equipements ADD COLUMN equipe TEXT NOT NULL DEFAULT ''",
+        );
+      }
+      // Le role de chaque famille est persiste : sans lui, la relecture au
+      // demarrage classait toutes les familles (EX 1250, PC 2000...) sous DT
+      // et le profil EXCAVATOR voyait le menu Famille de l'excavatrice vide.
+      final List<Map<String, Object?>> colsTypes = await db.rawQuery(
+        'PRAGMA table_info(types_dt)',
+      );
+      if (!colsTypes.any((row) => row['name'] == 'role')) {
+        await db.execute(
+          "ALTER TABLE types_dt ADD COLUMN role TEXT NOT NULL DEFAULT ''",
+        );
+      }
       await db.insert(
         'meta',
         <String, Object?>{
           'cle': 'vers_modele',
           'valeur': '8.0',
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    }
+    if (de < 9) {
+      // v9 : purge des familles orphelines. La colonne `role` est arrivée
+      // APRES les premieres synchronisations : la base locale contenait donc
+      // des familles sans role, que la compatibilite transitoire versait
+      // dans le menu DT (l'excavatrice voyait les familles des camions et
+      // inversement). La base n'etant plus bien organisee, on supprime
+      // toute famille sans role proprietaire : la synchro suivante recree
+      // les familles AVEC leur role depuis le serveur.
+      //
+      // GARDE-FOU (26/10) : sur une base ancienne dont l'etape v8 n'a pas pu
+      // s'executer (table absente au moment du PRAGMA, exception avalee), la
+      // colonne `role` MANQUE encore et cette purge levait
+      // « no such column: role ». L'erreur faisait echouer TOUTE l'ouverture
+      // (`Base locale indisponible`), donc plus aucun profil a l'ecran. On
+      // verifie et on ajoute la colonne ici : la migration reste
+      // idempotente dans les deux sens.
+      final List<Map<String, Object?>> colsAvant9 = await db.rawQuery(
+        'PRAGMA table_info(types_dt)',
+      );
+      if (!colsAvant9.any((Map<String, Object?> row) => row['name'] == 'role')) {
+        await db.execute(
+          "ALTER TABLE types_dt ADD COLUMN role TEXT NOT NULL DEFAULT ''",
+        );
+      }
+      await db.execute("DELETE FROM types_dt WHERE role = ''");
+      await db.execute(
+        'DELETE FROM ids_dt WHERE code_type NOT IN (SELECT code FROM types_dt)',
+      );
+      // Les menus machines derives sont reconstruits par la synchro suivante
+      // (elle remplace la table `equipements` entiere), aucune purge ici :
+      // une jointure sur le texte du nom serait fragile.
+      await db.insert(
+        'meta',
+        <String, Object?>{
+          'cle': 'vers_modele',
+          'valeur': '9.0',
         },
         conflictAlgorithm: ConflictAlgorithm.replace,
       );
@@ -612,6 +706,23 @@ class BaseLocale {
         ),
       );
 
+    // Seme les defauts serveur DANS LA BASE : sans ecriture, l'ecran
+    // Parametres, les outils externes (edit_meta.dart) et toute lecture SQL
+    // directe voyaient une meta vide alors que l'application, elle, utilisait
+    // le repli en memoire. Avec la ligne posee, tout le monde lit la meme
+    // valeur, et l'utilisateur peut la visualiser (et la changer) partout.
+    for (final MapEntry<String, String> e in _metaDefauts.entries) {
+      final Object? existant = _meta[e.key];
+      if (existant == null || '$existant'.isEmpty) {
+        await db.insert(
+          'meta',
+          <String, Object?>{'cle': e.key, 'valeur': e.value},
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+        _meta[e.key] = e.value;
+      }
+    }
+
     final List<Map<String, Object?>> lignesProfils =
         await db.query('profils', orderBy: 'ordre, rowid');
     if (lignesProfils.isNotEmpty) {
@@ -634,21 +745,31 @@ class BaseLocale {
       ))
           .map((r) => r['id']! as String)
           .toList();
-      _typesDT.add(TypeDT(code: code, ids: ids));
+      _typesDT.add(TypeDT(
+        code: code,
+        ids: ids,
+        role: (row['role'] as String?) ?? '',
+      ));
     }
 
     final List<Map<String, Object?>> lignesEquipements =
         await db.query('equipements', orderBy: 'rowid');
     if (lignesEquipements.isNotEmpty) _equipements.clear();
-    final Set<String> profilsServeur =
-        _profils.map((Profil profil) => profil.code).toSet();
+    final Set<String> profilsServeur = _profils
+        .map((Profil profil) => profil.code.trim().toLowerCase())
+        .toSet();
     for (final row in lignesEquipements) {
       // `profil` est la cle de lecture ; les lignes legacy sans code de profil
       // restent ignorées jusqu'au prochain snapshot serveur.
-      final String code = (row['profil'] as String?) ?? '';
-      if (!profilsServeur.contains(code)) continue;
-      (_equipements[code] ??= <({String id, String nom})>[]).add(
-        (id: row['id']! as String, nom: (row['nom'] as String?) ?? ''),
+      // Comparaison SANS CASSE : la feuille ecrit `DT` cote profils et peut
+      // ecrire `dt` cote equipements — une egalite stricte vidait tous les
+      // menus de l'ecran de connexion (« Famille » et « Identifiant » gris)
+      // alors que la base contenait bien les 25 engins.
+      final String code = ((row['profil'] as String?) ?? '').trim();
+      if (!profilsServeur.contains(code.toLowerCase())) continue;
+      (_equipements[code] ??= <({String id, String nom, String equipe})>[]).add(
+        (id: row['id']! as String, nom: (row['nom'] as String?) ?? '',
+         equipe: (row['equipe'] as String?) ?? ''),
       );
     }
 
@@ -808,6 +929,38 @@ class BaseLocale {
     );
     if (rows.isEmpty) return null;
     return rows.first['id']! as int;
+  }
+
+  /// Purge les evenements orphelins : ceux ecrits AVANT que la tablette ne
+  /// connaisse son identite (`source_device` vide).
+  ///
+  /// Le GPS demarre avec la base, avant le login : les mesures de cette
+  /// fenetre portaient un `source_device` vide, que le serveur refuse (CDC
+  /// §12). Elles ne partiront jamais et gonflent le compteur d'attente.
+  /// Appelee une fois à la connexion : ne touche QUE les PENDING vides, donc
+  /// jamais un evenement legitime en cours d'envoi.
+  Future<int> purgerEvenementsOrphelins() async {
+    final Database? db = _db;
+    if (db == null) return 0;
+    // `TRIM` : une source composee d'espaces echappait au test `= ''` et
+    // l'evenement restait eternellement en file (constate le 27/10 : deux
+    // GPS_UPDATE `src=` vide, PENDING, 0 tentative, sur les DEUX tablettes).
+    // On purge aussi un event_type vide, qui ne peut jamais passer la
+    // validation du serveur.
+    final int n = await db.delete(
+      'evenements',
+      where: "etat = 'PENDING' AND "
+          "(source_device IS NULL OR TRIM(source_device) = '' "
+          " OR event_type IS NULL OR TRIM(event_type) = '')",
+    );
+    if (n > 0) {
+      // On RELIT le compteur au lieu de le decrementer : `_enAttente` peut
+      // deja avoir ete fausse par un arret brutal ou par la migration §24.
+      await _recalculerAttente(db);
+      journaliser('PURGE $n evenement(s) orphelin(s) sans source_device');
+      debugPrint('PURGE $n evenement(s) orphelin(s) sans source_device');
+    }
+    return n;
   }
 
   /// Pose un evenement dans la file d'attente (CDC §12).
@@ -981,11 +1134,38 @@ class BaseLocale {
     final List<String> identifiantsDT = <String>[
       for (final TypeDT type in snapshot.typesDT) ...type.ids,
     ];
-    final Set<String> identifiantsDTUniques = identifiantsDT.toSet();
-    final Set<String> equipementsActifs = <String>{
-      for (final EquipementServeur e in snapshot.equipements)
-        if (e.actif) bas(e.profil),
+    // Unicite par COUPLE (famille, numero) — pas par numero seul : le
+    // serveur final numerote la flotte en continu (1..N), donc « 1 » existe
+    // en famille 1500 ET en famille EXCAVATOR ; c'est valide.
+    final Set<String> clesDT = <String>{
+      for (final TypeDT type in snapshot.typesDT)
+        for (final String id in type.ids) '${bas(type.code)}\u0000${bas(id)}',
     };
+    final int totalDT = identifiantsDT.length;
+    // Serveur final : les profils machines (DT, EXCAVATOR) puisent dans la
+    // FLOTTE (`dts`), pas dans `identifiants`. Un profil PERSONNE actif sans
+    // membre (SPOT) est tolere — le serveur n'emmet qu'un avertissement, et
+    // les equipes se creent depuis l'app. Exiger un identifiant pour chaque
+    // profil refuserait donc des referentiels parfaitement valides.
+    final Set<String> famillesActives = <String>{
+      for (final TypeDT t in snapshot.typesDT) bas(t.code),
+    };
+    bool profilSansEngin(Profil p) {
+      // Helpers CDC : toutes les formes de role acceptees (ROLE_TAB2/DT,
+      // ROLE_TAB3/EXCAVATOR). SPOT sans membre est tolele (serveur final).
+      if (BaseLocale.estSpotter(p.roleCdc)) return false;
+      // Serveur final : la jointure role-famille vient de la colonne `role`
+      // de la flotte — aucune liste en dur.
+      final Set<String> famillesDuProfil = <String>{
+        for (final TypeDT t in snapshot.typesDT)
+          if (t.role.trim().toUpperCase() == p.code.trim().toUpperCase() ||
+              t.role.trim().toUpperCase() ==
+                  p.roleCdc.trim().toUpperCase())
+            bas(t.code),
+      };
+      if (famillesDuProfil.isEmpty) return true;
+      return !famillesDuProfil.any(famillesActives.contains);
+    }
     if (codesProfils.length != snapshot.profils.length ||
         codesTypes.length != snapshot.typesDT.length ||
         snapshot.equipements.any((EquipementServeur e) =>
@@ -993,9 +1173,8 @@ class BaseLocale {
         equipementsUniques.length != snapshot.equipements.length ||
         // Une famille sans aucun numero est ignoree au chargement (le menu
         // du spotter ne l'affichera pas) : elle ne rend pas le lot incoherent.
-        identifiantsDTUniques.length != identifiantsDT.length ||
-        snapshot.profils.any((Profil p) =>
-            p.actif && !equipementsActifs.contains(bas(p.code)))) {
+        clesDT.length != totalDT ||
+        snapshot.profils.any((Profil p) => p.actif && profilSansEngin(p))) {
       throw const FormatException('Referentiels serveur incoherents');
     }
     final Database? db = _db;
@@ -1023,10 +1202,49 @@ class BaseLocale {
             'profil': profil.code,
             'id': equipement.id,
             'nom': equipement.nom,
+            'equipe': equipement.equipe,
           });
         }
+        // Serveur final : les machines viennent de la FLOTTE (`dts`), pas
+        // d'`identifiants`. On les ecrit aussi dans la table `equipements`
+        // pour que la relecture au demarrage rende les memes menus sans
+        // passage par le serveur. La jointure profil-famille vient du champ
+        // `role` de la flotte — aucune liste en dur.
+        for (final Profil profil in snapshot.profils) {
+          if (BaseLocale.estSpotter(profil.roleCdc)) continue;
+          for (final TypeDT type in snapshot.typesDT) {
+            final String roleFamille = type.role.trim().toUpperCase();
+            // Aucun repli : une famille sans `role` n'appartient a AUCUN
+            // profil machine (les anciennes lignes orphelines sont purgees
+            // par la migration v9, pas rattachees a DT de force).
+            final bool concerne = roleFamille == profil.code.trim().toUpperCase() ||
+                roleFamille == profil.roleCdc.trim().toUpperCase();
+            if (!concerne) continue;
+            for (final String numero in type.ids) {
+              await txn.insert('equipements', <String, Object?>{
+                'role': profil.roleCdc,
+                'profil': profil.code,
+                // ID COMPOSE famille-numero : c'est la cle reellement unique
+                // du parc (EX 2000 et PC 2000 partagent le numero 2000, la
+                // PK (role, id) sautait sinon et la transaction echouait,
+                // laissant la base vide — « aucun profil », synchro infinie).
+                // L'UI, elle, affiche la famille (menu 1) puis le numero seul
+                // (menu 2) ; le compose n'apparait jamais a l'ecran.
+                'id': '${type.code}-$numero',
+                'nom': BaseLocale.nomEngin(
+                  profil.code,
+                  numero,
+                  type.code,
+                ),
+              });
+            }
+          }
+        }
         for (final TypeDT type in snapshot.typesDT) {
-          await txn.insert('types_dt', <String, Object?>{'code': type.code});
+          await txn.insert('types_dt', <String, Object?>{
+            'code': type.code,
+            'role': type.role,
+          });
           for (final String id in type.ids) {
             await txn.insert('ids_dt', <String, Object?>{
               'code_type': type.code,
@@ -1052,15 +1270,52 @@ class BaseLocale {
       ..addEntries(
         snapshot.profils.map((Profil p) => MapEntry(
               p.code,
-              <({String id, String nom})>[
+              <({String id, String nom, String equipe})>[
                 for (final EquipementServeur e in snapshot.equipements)
                   if (e.actif &&
                       e.profil.trim().toLowerCase() ==
                           p.code.trim().toLowerCase())
-                    (id: e.id, nom: e.nom),
+                    (id: e.id, nom: e.nom, equipe: e.equipe),
               ],
             )),
       );
+    // Serveur final : les machines (DT, EXCAVATOR) ne sont plus dans
+    // `identifiants` mais dans la FLOTTE, servie au client dans le champ
+    // `dts` (famille + numero). Le menu de connexion des profils machines
+    // doit donc deriver de la, sinon il reste vide (« aucun engin ») sur
+    // un serveur conforme au nouveau modele, ou `identifiants` ne porte
+    // plus que des personnes.
+    //  - profil EXCAVATOR -> famille EXCAVATOR de la flotte ;
+    //  - profil DT        -> toutes les familles DT (1500, 785, ADT...).
+    // L'identifiant affiche est FAMILLE+NUMERO (« 1500-8 ») pour rester
+    // unique sur tout le parc (la numerotation est continue, mais le couple
+    // famille+numero est la cle reellement unique du serveur). Le nom est
+    // lisible (« DT 1500-8 »).
+    for (final Profil p in snapshot.profils) {
+      // Detection du role par les helpers CDC ; la jointure profil-famille
+      // vient du champ `role` de la flotte — aucune liste en dur.
+      if (BaseLocale.estSpotter(p.roleCdc)) continue;
+      final List<TypeDT> familles = snapshot.typesDT.where(
+        (TypeDT t) =>
+            t.role.trim().toUpperCase() == p.code.trim().toUpperCase() ||
+            t.role.trim().toUpperCase() == p.roleCdc.trim().toUpperCase(),
+      ).toList(growable: false);
+      if (familles.isEmpty) continue;
+      // ID COMPOSE famille-numero (coherence avec le stockage disque) : deux
+      // familles peuvent partager un numero (EX 2000 / PC 2000), le couple
+      // (profil, numero seul) n'est pas une cle. L'UI n'affiche jamais le
+      // compose : menu 1 = famille, menu 2 = numero seul, resolus par
+      // idsDuFamille/nomsDeFamille qui decoupent le compose.
+      final List<({String id, String nom, String equipe})> engins = <({String id, String nom, String equipe})>[
+        for (final TypeDT t in familles)
+          for (final String numero in t.ids)
+            (id: '${t.code}-$numero',
+             nom: BaseLocale.nomEngin(p.code, numero, t.code),
+             equipe: ''),
+      ];
+      if (engins.isEmpty) continue;
+      _equipements[p.code] = engins;
+    }
     _typesDT = List<TypeDT>.of(snapshot.typesDT);
   }
 
@@ -1073,6 +1328,98 @@ class BaseLocale {
     final Profil? profil = profilDuRole(role);
     return profil == null ? const <String>[] : idsDuProfil(profil);
   }
+
+  /// Serveur final : jointure role-famille par la colonne `role` de la
+  /// flotte — aucune liste ni deduction en dur. AUCUN repli sur les familles
+  /// sans role : les anciennes lignes syncronees avant la colonne `role`
+  /// (EX 1250, PC 2000...) étaient autrefois versees dans DT, melangeant les
+  /// menus des deux profils. Elles sont purgees par la migration v9.
+  List<String> famillesDuProfil(Profil profil) {
+    final String codeP = profil.code.trim().toUpperCase();
+    return <String>[
+      for (final TypeDT t in _typesDT)
+        if (t.role.trim().toUpperCase() == codeP ||
+            t.role.trim().toUpperCase() ==
+                profil.roleCdc.trim().toUpperCase())
+          t.code,
+    ];
+  }
+
+  /// Identifiants ENRÔLÉS d'une famille pour un profil machine — les IDs
+  /// composés `famille-numero` (clé des equipements), affichésNumero seul :
+  /// le couple (famille, numero) est deja selectionne par le menu 1, le
+  /// menu 2 ne doit montrer QUE le numero (ex. "2000" pas "EX-2000").
+  List<String> idsDuFamille(Profil profil, String famille) {
+    final String f = famille.trim().toUpperCase();
+    return List<String>.unmodifiable(<String>[
+      for (final ({String id, String nom, String equipe}) e in _lot(profil.code))
+        if (e.id.toUpperCase().startsWith('$f-'))
+          e.id.substring(f.length + 1),
+    ]);
+  }
+
+  /// Noms affichés des engins d'une famille (meme ordre que [idsDuFamille]).
+  List<String> nomsDeFamille(Profil profil, String famille) {
+    final String f = famille.trim().toUpperCase();
+    return List<String>.unmodifiable(<String>[
+      for (final ({String id, String nom, String equipe}) e in _lot(profil.code))
+        if (e.id.toUpperCase().startsWith('$f-')) e.nom,
+    ]);
+  }
+
+  /// ID COMPOSE enrôle (`famille-numero`) du numero [numero] choisi dans le
+  /// menu 2 de la famille [famille]. L'UI manipule le numero seul ; c'est ce
+  /// resolver qui reconstruit la cle des equipements (ex. "2000" + "EX" →
+  /// "EX-2000"), pour la session et la validation du couple id/nom.
+  String? idDeFamille(Profil profil, String famille, String numero) {
+    final String f = famille.trim().toUpperCase();
+    final String cle = '$f-${numero.trim()}';
+    for (final ({String id, String nom, String equipe}) e in _lot(profil.code)) {
+      if (e.id.toUpperCase() == cle) return e.id;
+    }
+    return null;
+  }
+
+  /// Équipes disponibles pour un profil personne (SPOT) — serveur final :
+  /// chaque membre de `identifiants` porte un code d'equipe (SP-001...).
+  /// Le menu 1 du login spotter liste ces equipes, donnees jamais codees.
+  List<String> equipesDuProfil(Profil profil) {
+    final Set<String> equipes = <String>{
+      for (final ({String id, String nom, String equipe}) e in _lot(profil.code))
+        if (e.equipe.isNotEmpty) e.equipe,
+    };
+    return List<String>.unmodifiable(equipes.toList()..sort());
+  }
+
+  /// Noms des personnes d'une equipe donnee (menu 2 du login spotter).
+  List<String> nomsDEquipe(Profil profil, String equipe) {
+    final String eq = equipe.trim().toLowerCase();
+    return List<String>.unmodifiable(<String>[
+      for (final ({String id, String nom, String equipe}) e in _lot(profil.code))
+        if (e.equipe.trim().toLowerCase() == eq) e.nom,
+    ]);
+  }
+
+  /// Identifiant de la personne [nom] de [equipe] (validation couple spotter).
+  String? idDeEquipe(Profil profil, String equipe, String nom) {
+    final String eq = equipe.trim().toLowerCase();
+    for (final ({String id, String nom, String equipe}) e in _lot(profil.code)) {
+      if (e.equipe.trim().toLowerCase() == eq && e.nom == nom) return e.id;
+    }
+    return null;
+  }
+
+  /// Identifiants (id) des personnes d'une equipe (menu 2 du login spotter).
+  List<String> idsDEquipe(Profil profil, String equipe) {
+    final String eq = equipe.trim().toLowerCase();
+    return List<String>.unmodifiable(<String>[
+      for (final ({String id, String nom, String equipe}) e in _lot(profil.code))
+        if (e.equipe.trim().toLowerCase() == eq) e.id,
+    ]);
+  }
+
+  /// Familles (types) de flotte disponibles pour un profil machine.
+  ///
 
   /// Noms affiches par le menu « Name », dans l'ordre de [idsDuProfil].
   ///
@@ -1093,7 +1440,7 @@ class BaseLocale {
   /// connexion interroge la base au lieu de deviner, et refuse les paires
   /// qui ne designent pas un seul et meme equipement.
   String? nomDuProfil(Profil profil, String id) {
-    for (final ({String id, String nom}) e in _lot(profil.code)) {
+    for (final ({String id, String nom, String equipe}) e in _lot(profil.code)) {
       if (e.id == id) return e.nom;
     }
     return null;
@@ -1101,7 +1448,7 @@ class BaseLocale {
 
   /// Identifiant de l'equipement correspondant au [nom] donne pour ce profil.
   String? idDuProfil(Profil profil, String nom) {
-    for (final ({String id, String nom}) e in _lot(profil.code)) {
+    for (final ({String id, String nom, String equipe}) e in _lot(profil.code)) {
       if (e.nom == nom) return e.id;
     }
     return null;
@@ -1114,8 +1461,8 @@ class BaseLocale {
     return profil == null ? null : nomDuProfil(profil, id);
   }
 
-  List<({String id, String nom})> _lot(String code) =>
-      _equipements[code] ?? const <({String id, String nom})>[];
+  List<({String id, String nom, String equipe})> _lot(String code) =>
+      _equipements[code] ?? const <({String id, String nom, String equipe})>[];
 
   /// Identifiant de l'appareil courant, inscrit comme `source_device`.
   void declarerAppareil(String id) => _appareil = id;
@@ -1123,8 +1470,28 @@ class BaseLocale {
   /// Identifiant de la passerelle courante, inscrit comme `gateway_id` (§12).
   void declarerPasserelle(String id) => _passerelle = id;
 
-  /// Versions lues dans `meta` (§23).
-  String? meta(String cle) => _meta[cle];
+  /// Valeurs par defaut de la configuration serveur : posees ici pour que
+  /// l'application soit operationnelle des la premiere installation, sans
+  /// passer par l'ecran Parametres. Toute valeur ecrite par l'utilisateur
+  /// (Parametres -> majMeta) est stockee dans `_meta` et PREVAUT sur ces
+  /// replis : le defaut ne sert que quand la cle est absente ou vide.
+  static const Map<String, String> _metaDefauts = <String, String>{
+    // Deploiement ACTIF (27/10) : c'est celui qui sert `actions=plans`,
+    // l'inventaire des Maps. L'ancienne URL (`AKfycbxFY618…`) reste figee sur
+    // un deploiement anterieur ou `plans` repond « action inconnue » et ou
+    // `sante` annonce « INACCESSIBLE » : les plans ne se telechargeaient
+    // jamais sur une tablette fraichement installee.
+    'api_base':
+        'https://script.google.com/macros/s/AKfycbwwE_oFNpVeZmXuJT6qL9yUGBW3Xn-930tEtfnH8k-hV-bBkyjH8b5VOA4aqgo_2UH2GA/exec',
+    'api_token': 'bcjp29afy3uso1mltw60vdnre5qgzk8xhi47',
+  };
+
+  /// Versions lues dans `meta` (§23), avec repli sur les defauts serveur.
+  String? meta(String cle) {
+    final String? valeur = _meta[cle];
+    if (valeur != null && valeur.isNotEmpty) return valeur;
+    return _metaDefauts[cle];
+  }
 
   /// Ecrit une valeur dans `meta`.
   Future<void> majMeta(String cle, String valeur) async {
@@ -1470,14 +1837,21 @@ class BaseLocale {
     if (db == null) return const <Map<String, Object?>>[];
     final List<Map<String, Object?>> lignes = await db.query(
       'evenements',
-      where: "etat = 'PENDING'",
+      // Seulement ce qui n'a PAS deja ete relaye au DT : sans ce filtre, la
+      // boucle de relais renvoyait indefiniment les memes lignes (l'ACK du DT
+      // etait journalise mais rien ne marquait la base) — avalanche de
+      // doublons sur le DT, UNIQUE constraint en cascade (observe 21/10).
+      where: "etat = 'PENDING' AND relaye = 0",
       orderBy: 'rowid',
       limit: limite,
     );
     return <Map<String, Object?>>[
       for (final Map<String, Object?> ligne in lignes)
         <String, Object?>{
-          'type': 'EVENT',
+          // Marqueur du protocole de lien (`EVENEMENT`), pas `EVENT` : les
+          // gateways BLE et Wi-Fi comparent au type exact et laissaient sinon
+          // tomber chaque evenement en « type inconnu » — rien n'etait relaye.
+          'type': BleProtocole.typeEvenement,
           'event_id': ligne['event_id'],
           'gateway_id': ligne['gateway_id'],
           'source_device': ligne['source_device'],
@@ -1498,6 +1872,23 @@ class BaseLocale {
     }
   }
 
+  /// Marque un evenement comme **relayé au DT** (v8).
+  ///
+  /// L'ACK du DT ne change pas `etat` (qui porte la synchro serveur 4G) : il
+  /// pose seulement `relaye = 1`, pour que la boucle de relais ne reprenne
+  /// jamais la même ligne. Si le lien tombe avant l'ACK, la ligne reste
+  /// `relaye = 0` et sera retransmise — rien n'est perdu.
+  Future<void> marquerRelaye(String eventId) async {
+    final Database? db = _db;
+    if (db == null) return;
+    await db.update(
+      'evenements',
+      <String, Object?>{'relaye': 1},
+      where: 'event_id = ?',
+      whereArgs: <Object?>[eventId],
+    );
+  }
+
   /// Event IDs déjà traités localement (idempotence CDC §17).
   final Set<String> _eventIdsConnus = <String>{};
 
@@ -1507,6 +1898,47 @@ class BaseLocale {
   /// Journal technique BLE lisible par l'UI (CDC §22).
   List<String> get journalBle => List<String>.unmodifiable(_journalBle);
 
+  /// Ajoute une ligne au journal reseau affiche par la supervision.
+  ///
+  /// STATIQUE imperatif : les couches BLE et Wi-Fi n'ont pas acces a
+  /// l'instance de base au moment ou elles instancient leur journal (elles
+  /// recoivent un [JournalBle] / [JournalWifi] a la construction). Sans ce
+  /// point unique, la supervision affichait « Aucun evenement reseau
+  /// journalise » alors que les connexions fonctionnaient : chaque couche
+  /// ecrivait dans son propre journal memoire que personne ne lisait.
+  static void journaliserReseau(String texte) {
+    for (final BaseLocale b in _instances) {
+      b._journalBle.insert(0, texte);
+      if (b._journalBle.length > 200) b._journalBle.removeLast();
+      // Persistance : sans elle, « journaux pas precis » — la supervision
+      // n'aurait qu'un tampon memoire efface au redemarrage, impossible de
+      // relire ce qui s'est passe pendant une connexion.
+      b.journaliser('[RESEAU] $texte');
+      // NOTIFICATION (27/10) : sans elle, le tampon memoire etait mis a jour
+      // mais aucun widget n'etait repeint — la fenetre de supervision restait
+      // sur « Aucun evenement reseau journalise » alors que des lignes
+      // arrivaient. La session est le Listenable de l'application ; la base
+      // n'est qu'un magasin, d'ou ce relais.
+      b.surJournalReseau?.call(texte);
+    }
+  }
+
+  /// Relais vers la session : appele a chaque ligne de journal reseau.
+  ///
+  /// Permet a l'interface (supervision) d'etre repeinte sans que la base
+  /// connaisse la session — l'inverse creerait un cycle de dependances.
+  void Function(String texte)? surJournalReseau;
+
+  /// Instances vivantes (en general une seule) : le journal reseau y est
+  /// pousse sans que les couches communication connaissent la base.
+  static final List<BaseLocale> _instances = <BaseLocale>[];
+
+  /// Journal des couches communication (BLE et Wi-Fi) vers l'UI.
+  ///
+  /// La session en injecte une instance dans chaque gateway/client. Sans ce
+  /// branchement, la supervision affichait « Aucun evenement reseau
+  /// journalise » : chaque couche ecrivait dans son journal memoire prive.
+  static JournalReseauUI journalReseau() => JournalReseauUI();
   bool _refuser(String motif) {
     refusEnCours = motif;
     return false;
@@ -1852,6 +2284,10 @@ class BaseLocale {
       if (serveur.numero.isEmpty || serveur.carte.isEmpty) continue;
       final Blast? existant = parNumero(serveur.numero);
       if (existant != null) {
+        // Instantane AVANT modification : sert a savoir si quelque chose a
+        // reellement change (voir le test `change` plus bas).
+        final String cartesAvant = existant.cartes.join(',');
+        final String planAvant = existant.plan;
         // Cartes/RL : la liste serveur fait foi (remplacement, pas fusion).
         // Le plan local deja telecharge n'est jamais perdu.
         final List<String> cartesServeur = serveur.cartes.isNotEmpty
@@ -1915,11 +2351,25 @@ class BaseLocale {
             '${blocsRetires.map((b) => '${b.numero}@${b.carte}').join(', ')}',
           );
         }
+        // NE RIEN ECRIRE quand rien n'a change.
+        //
+        // Cette mise a jour etait rejouee a CHAQUE passe de synchro (toutes
+        // les ~40 s) : le journal des tablettes montrait un
+        // `UPDATE blasts numero = 106/107` en boucle alors que le contenu
+        // etait identique (constat du 27/10). Chaque passe touchait le
+        // fichier SQLite sans motif, avec un risque de contention avec les
+        // ecritures metier.
+        final String cartesTexte = existant.cartes.join(',');
+        final bool change = cartesTexte != cartesAvant ||
+            existant.plan != planAvant ||
+            blocsRetires.isNotEmpty;
+        if (!change) continue;
+
         _ecrire((Database db) async {
           await db.update(
             'blasts',
             <String, Object?>{
-              'carte': existant.cartes.join(','),
+              'carte': cartesTexte,
               'plan': existant.plan,
             },
             where: 'numero = ?',
@@ -2029,24 +2479,44 @@ class BaseLocale {
   /// selectionne tant qu'il n'est pas encore telecharge en local.
   final Map<String, String> _planUrls = <String, String>{};
 
+  /// Identifiant Drive du plan de chaque carte, quand le serveur le fournit.
+  /// Prioritaire sur [_planUrls] : voir [planPourCarte].
+  final Map<String, String> _planIds = <String, String>{};
+
+  /// URL de telechargement direct d'un fichier Drive par son identifiant.
+  ///
+  /// `confirm=t` evite la page intermediaire « Ce fichier depasse la taille
+  /// maximale » que Drive sert aux gros fichiers sans ce parametre.
+  static String urlDrive(String id) =>
+      'https://drive.google.com/uc?export=download&confirm=t&id=$id';
+
   /// Chemin du plan local pour une carte donnee, si telecharge.
   String? planDe(String carte) => _plansLocaux[carte];
 
   /// Plan d'une carte, dans l'ordre de preference :
   /// 1. fichier local deja telecharge ;
-  /// 2. URL serveur de CETTE carte (pas celle de la premiere du blast) ;
-  /// 3. URL Apps Script construite a la volee `?action=plan&carte=<code>`.
+  /// 2. **identifiant Drive** de CETTE carte (voie directe, la plus robuste) ;
+  /// 3. URL serveur de CETTE carte (pas celle de la premiere du blast) ;
+  /// 4. URL Apps Script construite a la volee `?action=plan&carte=<code>`.
   ///
-  /// Le repli 3 est indispensable : tant que la synchro n'a pas tourne depuis
-  /// le deploiement serveur qui renvoie `blocs_par_carte[].plan_url`, la table
-  /// [_planUrls] est vide et `planCourant` retomberait sur `blast.plan`, qui
-  /// ne porte QUE la premiere carte du blast (bug RL 262.5 -> plan 260).
+  /// L'ordre 2 avant 3 est volontaire : une URL `?action=plan` refait une
+  /// recherche Drive **par nom** a chaque appel (deux allers-retours, quota
+  /// Apps Script, echec des que le partage ou le nom change). L'identifiant
+  /// Drive, lui, se resout en une seule requete et ne depend de rien d'autre.
+  ///
+  /// Le repli 4 reste indispensable : tant que la synchro n'a pas tourne
+  /// depuis le deploiement qui renvoie `blocs_par_carte[]`, les tables sont
+  /// vides et `planCourant` retomberait sur `blast.plan`, qui ne porte QUE la
+  /// premiere carte du blast (bug RL 262.5 -> plan 260).
   ///
   /// Rend `null` seulement si le code de carte est vide.
   String? planPourCarte(String carte) {
     if (carte.isEmpty) return null;
     final String? local = _plansLocaux[carte];
     if (local != null && local.isNotEmpty) return local;
+    // Voie directe par identifiant Drive : une requete, aucune recherche.
+    final String? id = _planIds[carte];
+    if (id != null && id.isNotEmpty) return urlDrive(id);
     final String? url = _planUrls[carte];
     if (url != null && url.isNotEmpty) return url;
     // Repli : URL du plan de CETTE carte, derivee du code seul. Le serveur
@@ -2070,6 +2540,15 @@ class BaseLocale {
   /// URL serveur connue pour une carte (null si jamais recue).
   String? urlPlanDe(String carte) => _planUrls[carte];
 
+  /// Identifiant Drive connu pour une carte (null si jamais recu).
+  String? idPlanDe(String carte) => _planIds[carte];
+
+  /// Enregistre l'identifiant Drive du plan d'une carte.
+  void poserIdPlan(String carte, String id) {
+    if (carte.isEmpty || id.isEmpty) return;
+    _planIds[carte] = id;
+  }
+
   /// Enregistre l'URL serveur d'une carte (reception des blasts).
   void poserUrlPlan(String carte, String url) {
     if (carte.isEmpty || url.isEmpty) return;
@@ -2088,6 +2567,41 @@ class BaseLocale {
     _plansLocaux[carte] = cheminFichier;
   }
 
+  /// Verifie la signature reelle d'un fichier telecharge.
+  ///
+  /// Une reponse JSON du serveur portait l'extension `.jpg` sans en etre une :
+  /// on lit les premiers octets pour le savoir, plutot que de se fier au nom.
+  static Future<bool> _estFichierImage(File fichier) async {
+    try {
+      final int taille = await fichier.length();
+      if (taille < 12) return false;
+      final RandomAccessFile f = await fichier.open();
+      final Uint8List tete = await f.read(12);
+      await f.close();
+      if (tete.length < 3) return false;
+      // PNG
+      if (tete[0] == 0x89 && tete[1] == 0x50 && tete[2] == 0x4E) return true;
+      // JPEG
+      if (tete[0] == 0xFF && tete[1] == 0xD8 && tete[2] == 0xFF) return true;
+      // GIF
+      if (tete[0] == 0x47 && tete[1] == 0x49 && tete[2] == 0x46) return true;
+      // BMP
+      if (tete[0] == 0x42 && tete[1] == 0x4D) return true;
+      // WebP (RIFF....WEBP)
+      if (tete.length >= 12 &&
+          tete[0] == 0x52 &&
+          tete[8] == 0x57 &&
+          tete[9] == 0x45 &&
+          tete[10] == 0x42 &&
+          tete[11] == 0x50) {
+        return true;
+      }
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// Charge au demarrage les plans deja telecharges dans le dossier
   /// documents de l'application (`plan_<code>.<ext>`).
   ///
@@ -2101,17 +2615,66 @@ class BaseLocale {
     try {
       final Directory dossier = await getApplicationDocumentsDirectory();
       if (!await dossier.exists()) return;
-      final RegExp motif = RegExp(r'^plan_(.+)\.(jpg|jpeg|png|gif)$');
+      final RegExp motif = RegExp(r'^plan_(.+)\.(jpg|jpeg|png|gif|webp|bmp)$');
       await for (final FileSystemEntity entite in dossier.list()) {
         if (entite is! File) continue;
         final String nom = entite.uri.pathSegments.last;
         final RegExpMatch? m = motif.firstMatch(nom);
         if (m == null) continue;
-        _plansLocaux[m.group(1)!] = entite.path;
+        // Fichiers corrompus des versions precedentes : le serveur refusait
+        // le telechargement (token) en renvoyant du JSON, ecrit tel quel.
+        // Un tel fichier ne s'affiche jamais et empechait pour toujours la
+        // re-telecharge (il « existait »). On le supprime pour repartir.
+        if (await _estFichierImage(entite)) {
+          _plansLocaux[m.group(1)!] = entite.path;
+        } else {
+          try {
+            await entite.delete();
+            debugPrint('Plan corrompu supprime : $nom');
+          } catch (_) {
+            // Verrouille : il sera simplement ignore cette session.
+          }
+        }
       }
     } catch (e) {
       debugPrint('Chargement des plans locaux impossible : $e');
     }
+  }
+
+  /// Supprime les plans locaux de cartes ABSENTES du Drive.
+  ///
+  /// Miroir du dossier Drive : ce qui n'y est plus ne doit plus etre sur la
+  /// tablette (une carte obsolete fait afficher un plan faux, pire que pas de
+  /// plan). [cartesPresentes] est l'inventaire recu du serveur — jamais un
+  /// ensemble vide : un inventaire vide signifie « Drive vide », cas ou toute
+  /// suppression doit deja avoir ete decidee par l'appelant.
+  ///
+  /// Rend le nombre de fichiers supprimes.
+  Future<int> purgerPlansAbsents(Set<String> cartesPresentes) async {
+    int supprimes = 0;
+    final List<String> aSupprimer = <String>[
+      for (final String carte in _plansLocaux.keys)
+        if (!cartesPresentes.contains(carte)) carte,
+    ];
+    for (final String carte in aSupprimer) {
+      final String? chemin = _plansLocaux.remove(carte);
+      // L'identifiant et l'URL ne doivent pas survivre non plus : sinon le
+      // plan repartirait en telechargement vers un fichier disparu du Drive.
+      _planIds.remove(carte);
+      _planUrls.remove(carte);
+      if (chemin == null || chemin.isEmpty) continue;
+      try {
+        final File f = File(chemin);
+        if (await f.exists()) {
+          await f.delete();
+          supprimes++;
+          debugPrint('Plan obsolete supprime : $carte');
+        }
+      } catch (e) {
+        debugPrint('Plan obsolete non supprimable ($carte) : $e');
+      }
+    }
+    return supprimes;
   }
 
   /// Ecrit un bloc s'il n'existe pas encore sur le disque : l'upsert memoire
@@ -2332,4 +2895,11 @@ class BaseLocale {
           ],
         ),
       ];
+}
+
+/// Journal unique des couches communication : BLE et Wi-Fi ecrivent ici, et
+/// la supervision reseau de l'UI lit [BaseLocale.journalBle].
+class JournalReseauUI implements JournalBle, JournalWifi {
+  @override
+  void ligne(String texte) => BaseLocale.journaliserReseau(texte);
 }

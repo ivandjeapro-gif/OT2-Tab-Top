@@ -59,10 +59,14 @@ class PermissionsBle {
       final bool emettre =
           resultats[Permission.bluetoothAdvertise]?.isGranted ?? false;
 
-      // Sur Android < 12, les permissions BLUETOOTH_* n'existent pas et
-      // reviennent « denied » sans que cela signifie un refus utilisateur :
-      // si l'une est accordee, on considere le lot valide.
-      if (scan || connecter || emettre) return scan && connecter && emettre;
+      // Sur Android >= 12 :
+      // - Une excavatrice a besoin de `emettre` (advertise) et `connecter`.
+      // - Un DT/Spotter a besoin de `scan` et `connecter`.
+      // Exiger les trois a la fois bloque un appareil dont l'OS n'accorde
+      // que les permissions utiles a son role.
+      if (scan || connecter || emettre) {
+        return (scan && connecter) || (emettre && connecter);
+      }
 
       // Aucune des trois accordee : soit Android < 12 (les permissions
       // dediees n'y existent pas), soit refus franc. On distingue avec la

@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
 
 import '../state/etat_couche.dart';
+import '../communication/wifi/wifi_direct.dart';
 import '../state/session.dart';
 import '../theme/app_theme.dart';
 import '../theme/responsive.dart';
 import '../widgets/profile_shell.dart';
 import '../widgets/status_badges.dart';
-import '../widgets/voyants_entete.dart';
 
 /// Ecran de l'excavatrice : compteurs E/N/E rafraichis a chaque synchro.
 class ExcavatorScreen extends StatelessWidget {
@@ -16,9 +16,10 @@ class ExcavatorScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Voyants dans le corps de l'ecran, a taille pleine (voir l'en-tete du
+    // tableau plus bas) : seul le spotter les porte dans le bandeau.
     return ProfileShell(
       session: session,
-      voyants: ProfilVoyants.excavatrice,
       body: ListenableBuilder(
         listenable: session,
         builder: (context, _) {
@@ -117,9 +118,51 @@ class ExcavatorScreen extends StatelessWidget {
                         ),
                       ),
                     ),
-                    // Les voyants (GPS, point d'acces, BLE) sont passes dans
-                    // le bandeau du haut : ils ne prennent plus de place ici,
-                    // et le nom dispose de toute la largeur.
+                    // A droite du nom, a taille pleine : le point d'acces (le
+                    // reseau que les autres tablettes rejoignent), le BLE
+                    // (la proximite de 10 m et la session perle) et le XBee.
+                    //
+                    // MEME REGLE QUE PARTOUT AILLEURS (bandeau, ecran DT,
+                    // supervision) : un transport decoche dans les Parametres
+                    // n'existe pas a l'ecran. Ces trois badges etaient poses
+                    // sans condition, si bien que le point d'acces restait
+                    // affiche alors que l'operateur n'avait coche que BLE et
+                    // XBee (constat du 27/10). Le XBee, lui, n'etait pas
+                    // represente du tout sur cet ecran.
+                    if (session.transportHotspotActif &&
+                        !session.transportPrioritaireActif) ...<Widget>[
+                      SizedBox(width: 8 * k),
+                      SizedBox(
+                        width: mise.tailleBadge.width,
+                        height: mise.tailleBadge.height,
+                        child: PointAccesStatusBadge(
+                          etat: session.etatPointAcces,
+                          ssid: session.ssidExcavatrice,
+                          // Tap sur le badge : ouvre les Reglages du partage
+                          // quand il est inactif. C'est la voie demandee du
+                          // 21/10 : l'operateur active le partage systeme
+                          // lui-meme (TETHER_PRIVILEGED n'est pas accordable),
+                          // puis l'app detecte `ap0` et l'utilise.
+                          surTap: () => WifiDirect.ouvrirReglagesPartage(),
+                        ),
+                      ),
+                    ],
+                    if (session.transportBleActif) ...<Widget>[
+                      SizedBox(width: 8 * k),
+                      SizedBox(
+                        width: mise.tailleBadge.width,
+                        height: mise.tailleBadge.height,
+                        child: BleStatusBadge(etat: session.etatBle),
+                      ),
+                    ],
+                    if (session.transportXbeeActif) ...<Widget>[
+                      SizedBox(width: 8 * k),
+                      SizedBox(
+                        width: mise.tailleBadge.width,
+                        height: mise.tailleBadge.height,
+                        child: XbeeStatusBadge(etat: session.etatXbee),
+                      ),
+                    ],
                   ],
                 ),
                 // Ecart proportionnel : il fait partie de la repartition
@@ -203,11 +246,19 @@ class ExcavatorScreen extends StatelessWidget {
                                           horizontal: 12 * k,
                                         ),
                                         child: Text(
+                                          // « — » tant qu'aucun fix GNSS : on
+                                          // n'affiche jamais de coordonnees
+                                          // inventees.
                                           i == 0
-                                              ? '${session.easting}'
+                                              ? (session.easting?.toString() ??
+                                                  '—')
                                               : i == 1
-                                                  ? '${session.northing}'
-                                                  : '${session.elevation}',
+                                                  ? (session.northing
+                                                          ?.toString() ??
+                                                      '—')
+                                                  : (session.elevation
+                                                          ?.toString() ??
+                                                      '—'),
                                           style: TextStyle(
                                             fontFamily: kSerif,
                                             fontSize: (40 * k).clamp(18.0, 40.0),

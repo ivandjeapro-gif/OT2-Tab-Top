@@ -50,9 +50,31 @@ class TransportTcpWifi implements TransportWifi {
   // ---------------------------------------------------------------- côté TAB 2
 
   /// Démarre le serveur d'écoute (point d'accès TAB 2).
+  ///
+  /// IMPORTANT : on ecoute sur `0.0.0.0` (toutes interfaces), jamais sur
+  /// l'IP d'une interface precise. Sur Android, binder une adresse locale
+  /// alors qu'un port deja ecoute sur une autre interface leve
+  /// `SocketException: The shared flag to bind() needs to be 'true'` —
+  /// c'etait le cas ici (server socket refuse, DT injoignable). Ecouter
+  /// partout couvre aussi le hotspot ET le Wi-Fi local, ce qui est
+  /// exactement le souhait d'une passerelle.
   Future<void> heberger() async {
     if (_serveur != null) return;
-    _serveur = await ServerSocket.bind(adresseLocale, port);
+    try {
+      _serveur = await ServerSocket.bind(
+        InternetAddress.anyIPv4,
+        port,
+        shared: false,
+      );
+    } on SocketException {
+      // Port deja pris (instance precedente non liberee) : on retente en
+      // partage, ce qu'Android autorise explicitement a plusieurs sockets.
+      _serveur = await ServerSocket.bind(
+        InternetAddress.anyIPv4,
+        port,
+        shared: true,
+      );
+    }
     _port = _serveur!.port;
     _serveur!.listen(
       (Socket socket) {
@@ -131,7 +153,30 @@ class TransportTcpWifi implements TransportWifi {
 
   @override
   Future<LienWifi> connecter(ReseauWifi reseau) async {
+    // Lier la socket à l'interface du même sous-réseau que la cible : sans
+    // cela, le trafic part sur la route par défaut (4G — le mécanisme
+    // « forcer cellulaire » l'impose) et la connexion au serveur local
+    // échouait alors que le réseau Wi-Fi était sain (observé 21/10 :
+    // ping -I wlan0 → 0 % de perte, sans → 100 %).
+    InternetAddress? source;
+    try {
+      final List<NetworkInterface> interfaces =
+          await NetworkInterface.list(type: InternetAddressType.IPv4);
+      final String prefixe = sousReseauDe(reseau.adresse) ?? '';
+      for (final NetworkInterface i in interfaces) {
+        for (final InternetAddress a in i.addresses) {
+          if (!a.isLoopback && a.address.startsWith(prefixe)) {
+            source = a;
+            break;
+          }
+        }
+        if (source != null) break;
+      }
+    } catch (_) {
+      // Pas d'interface matchée : connexion sans liaison explicite.
+    }
     final Socket socket = await Socket.connect(reseau.adresse, port,
+            sourceAddress: source,
             timeout: delaiConnexion)
         .timeout(delaiConnexion);
     return SocketLienWifi._client(socket);

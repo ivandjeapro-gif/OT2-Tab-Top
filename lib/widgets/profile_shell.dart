@@ -66,36 +66,48 @@ class ProfileShell extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: AppColors.paper,
-      body: SafeArea(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            AppHeader(
-              onExit: () => _confirmerSortie(context),
-              voyants: voyants == null
-                  ? null
-                  : VoyantsEntete(session: session, profil: voyants!),
-            ),
-            Expanded(child: body),
-            Row(
-              children: [
-                // Fleche d'echange a gauche : animee pendant un envoi
-                // effectif vers le DT (Wi-Fi ou BLE). Ouvre la supervision
-                // reseau (CDC §21/§22).
-                DataExchangeButton(
-                  onPressed: () => SupervisionReseau.montrer(context, session),
-                  session: session,
-                ),
-                Expanded(
-                  child: NotificationTicker(session: session),
-                ),
-                // Nuage a droite : anime pendant une synchro serveur (4G).
-                SyncCloudIcon(session: session),
-              ],
-            ),
-          ],
+    // TOUT le shell ecoute la session, bandeau compris.
+    //
+    // Bug corrige le 26/10 : seul le `body` de l'ecran avait son propre
+    // `ListenableBuilder`. Le bandeau, lui, etait construit une fois par ce
+    // build et ne se reconstruisait qu'au gré des rechargements du parent —
+    // si bien que les voyants 4G/BLE/XBee restaient FIGES toute la session :
+    // la sonde tournait (verifiable dans logcat) mais rien ne repeignait
+    // l'ecran. C'est la cause du « le badge ne suit pas ».
+    return ListenableBuilder(
+      listenable: session,
+      builder: (context, _) => Scaffold(
+        backgroundColor: AppColors.paper,
+        body: SafeArea(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              AppHeader(
+                onExit: () => _confirmerSortie(context),
+                voyants: voyants == null
+                    ? null
+                    : VoyantsEntete(session: session, profil: voyants!),
+              ),
+              Expanded(child: body),
+              Row(
+                children: [
+                  // Fleche d'echange a gauche : animee pendant un envoi
+                  // effectif vers le DT (Wi-Fi ou BLE). Ouvre la supervision
+                  // reseau (CDC §21/§22).
+                  DataExchangeButton(
+                    onPressed: () =>
+                        SupervisionReseau.montrer(context, session),
+                    session: session,
+                  ),
+                  Expanded(
+                    child: NotificationTicker(session: session),
+                  ),
+                  // Nuage a droite : anime pendant une synchro serveur (4G).
+                  SyncCloudIcon(session: session),
+                ],
+              ),
+            ],
+          ),
         ),
       ),
     );

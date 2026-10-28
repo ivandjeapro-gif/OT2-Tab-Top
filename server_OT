@@ -1,10 +1,10 @@
 /**
  * ============================================================
- *  ORE TRACKING — SERVEUR CENTRAL (Google Apps Script)
+ *  ORE TRACKING â€” SERVEUR CENTRAL (Google Apps Script)
  * ============================================================
  *
  *  Fichier : server_OT
- *  Version protocole : 1.0 — Modele de donnees : 8.0
+ *  Version protocole : 1.0 â€” Modele de donnees : 8.0
  *
  *  DEPLOIEMENT (guide complet en tete du README, voir fin de fichier) :
  * 1. Creer un Google Spreadsheet ; les onglets sont initialises automatiquement.
@@ -25,21 +25,23 @@
  *
  *  Cote client, TransmetteurHttp lit `ok` en PLUS du code HTTP.
  *  Cote auth : les en-tetes (Authorization, X-Protocol-Version) sont
- *  invisibles — le jeton voyage en parametre de requete ?token=...,
+ *  invisibles â€” le jeton voyage en parametre de requete ?token=...,
  *  toujours sur HTTPS (deploiement Web App).
  *  Endpoints (route par parametre ?action=... car le chemin Apps Script
  *  est fixe) :
- *      POST ?action=evenement   { enveloppe CDC §12 }
+ *      POST ?action=evenement   { enveloppe CDC Â§12 }
  *      GET  ?action=affectation
  *      GET  ?action=blasts
  *      GET  ?action=referentiels       (profils, equipements et DT)
  *      GET  ?action=plan&carte=<code>  (streaming de l'image depuis Drive ;
  *                                        <code> = nom de fichier sans extension)
  *      GET  ?action=sante              (diagnostic deploiement)
+ *      GET  ?action=donnees&onglet=X   (lecture brute d'un onglet syncable)
+ *      POST ?action=donnees             (ecriture d'un onglet syncable)
  */
 
 // ============================================================
-//  CONFIG — a remplir apres creation du Spreadsheet
+//  CONFIG â€” a remplir apres creation du Spreadsheet
 // ============================================================
 
 const CONFIG = {
@@ -49,7 +51,7 @@ const CONFIG = {
   /** Jeton partage avec les tablettes (meta.api_token cote client) */
   TOKEN: 'bcjp29afy3uso1mltw60vdnre5qgzk8xhi47',
 
-  /** Version de protocole acceptee (X-Protocol-Version → verifie dans le corps) */
+  /** Version de protocole acceptee (X-Protocol-Version â†’ verifie dans le corps) */
   VERSION_PROTOCOLE: '1.0',
 
   /** ID du dossier Drive contenant les plans des cartes (JPG) */
@@ -76,7 +78,7 @@ const CONFIG = {
     //  - `identifiants` : ce que l'utilisateur choisit au login (camion,
     //    machine, ou nom du spotter) ;
     //  - `flotte`       : les DT du site (famille + numero), pour le
-    //    formulaire « Nouvelle ligne » ;
+    //    formulaire Â« Nouvelle ligne Â» ;
     //  - `equipements`  : le materiel (GNSS, capteurs...), reserve ;
     //  - `tab`          : les tablettes / boites BLE (TAB3-01...).
     IDENTIFIANTS: 'identifiants',
@@ -90,7 +92,7 @@ const CONFIG = {
 };
 
 // ============================================================
-//  INITIALISATION — le serveur cree lui-meme ses onglets
+//  INITIALISATION â€” le serveur cree lui-meme ses onglets
 // ============================================================
 
 /**
@@ -105,7 +107,7 @@ const SCHEMAS = {
   // `carte` dans `blocs` permet de regrouper les blocs par RL : un blast peut
   // couvrir plusieurs cartes (une par RL = premier segment du code), et chaque
   // bloc est rattache a l'une d'elles. Cela remplace l'ancien modele
-  // implicite « un blast = une carte ».
+  // implicite Â« un blast = une carte Â».
   blocs: ['blast', 'numero', 'carte'],
   // `code` reste la cle unique de jointure (blasts.carte -> cartes.code) et
   // correspond au NOM DU FICHIER SANS EXTENSION dans le dossier Drive.
@@ -122,11 +124,19 @@ const SCHEMAS = {
   journal: ['horodatage', 'message'],
   notifications: ['id', 'profil', 'message', 'horodatage'],
   profils: ['code', 'libelle', 'titre', 'role_cdc', 'icone', 'ordre', 'actif'],
-  // Identifiants proposes au login (un par equipement/personne).
-  identifiants: ['profil', 'id', 'nom', 'actif'],
-  // Flotte de DT : `famille` = 1500 / 785 / ADT, `numero` = entier unique
-  // sur tout le parc, `actif` = booleen. Une ligne = un camion.
-  flotte: ['famille', 'numero', 'actif'],
+  // Identifiants proposes au login : UNIQUEMENT des personnes.
+  // `role`    : SPOTER / CHEF_EQUIPE (equipes de spotters) â€” vide pour les
+  //             autres profils ;
+  // `equipe`  : code de l'equipe du membre (SP-001, bac...) â€” SPOT seulement.
+  // Les machines (DT/EXCAVATOR) se connectent via `flotte` : plus aucune
+  // ligne machine ici, sinon deux sources de verite qui divergent.
+  identifiants: ['profil', 'id', 'nom', 'role', 'equipe', 'actif'],
+  // Tous les engins numerotes du site, TOUS PROFILS confondus (DT 1500/785/ADT,
+  // EXCAVATOR, ...). La colonne `role` rattache chaque famille a son PROFIL :
+  // c'est elle que le login lit pour savoir quelles familles proposer — plus
+  // aucune liste en dur ni deduction par le nom. Un engin = une ligne,
+  // UNIQUE(famille, numero), familles distinctes par role.
+  flotte: ['role', 'famille', 'numero', 'actif'],
   // Materiel du site (GNSS, capteurs...) : reserve, rempli a la main.
   equipements: ['id', 'type', 'nom', 'actif'],
   // Tablettes / boites BLE : `role` = role CDC de l'appareil.
@@ -136,8 +146,32 @@ const SCHEMAS = {
 
 const COLONNES_EVENEMENTS = [
   'event_id', 'gateway_id', 'source_device', 'event_type', 'timestamp',
-  'received_at', 'payload', 'easting', 'northing',
+  'received_at', 'payload', 'easting', 'northing', 'elevation',
+  // Perle : position du godet et moyenne de session (Â§2.3).
+  'xbloc', 'ybloc', 'zbloc', 'xmoy', 'ymoy', 'zmoy', 'nombre', 'dt',
+  // Photos : la base64 sort du payload (limite de 50 000 par cellule) et se
+  // decoupe en morceaux successifs.
+  'photo', 'photo_2', 'photo_3', 'photo_4', 'photo_5', 'photo_6',
+  'photo_7', 'photo_8',
 ];
+
+/**
+ * Premiere ligne de DONNEES de l'onglet `evenements`.
+ *
+ * 1 = pas d'entete (ancien format, donnees des la ligne 1).
+ * 2 = entete en ligne 1 (format courant).
+ *
+ * Detecte a chaque lecture via `ligneDebutEvenements()` : une migration
+ * partielle (entete posee sur un onglet deja rempli) ne doit jamais faire
+ * relire la ligne de titres comme un evenement.
+ */
+function ligneDebutEvenements(sh) {
+  if (sh.getLastRow() === 0) return 2;
+  const premiere = String(sh.getRange(1, 1).getValue()).trim();
+  // Un event_id valide = UUID. Tout le reste (titre « event_id » inclus)
+  // signifie qu'une entete est presente.
+  return /^[0-9a-f-]{36}$/i.test(premiere) ? 1 : 2;
+}
 
 /**
  * Cree les onglets manquants du Spreadsheet, avec leur entete quand il en
@@ -148,19 +182,58 @@ const COLONNES_EVENEMENTS = [
  * insertion seulement si manquant) et executable a la main depuis l'editeur
  * (fonction initialiser) pour verifier le deploiement.
  */
+/** Vrai quand initialiser() a deja tourne dans CETTE execution Apps Script. */
+var INITIALISE_POUR_EXECUTION = false;
+
 function initialiser() {
+  // Perf (27/10) : voir INITIALISE_POUR_EXECUTION. Sans cette sortie, le POST
+  // d'un evenement payait l'ouverture du classeur + la relecture de lotte
+  // et equipements a chaque fois (7,9 s mesure), d'ou la redirection 302
+  // sans corps et des evenements bloques en file.
+  if (INITIALISE_POUR_EXECUTION) return 'deja fait';
+  INITIALISE_POUR_EXECUTION = true;
   const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  // Migration avant la creation des onglets : elle convertirait sinon dans
+  // le vide si `flotte` venait d'etre creee vide par sa propre boucle
+  // (ecrireTable cree l'onglet absent, la migration peut donc tourner
+  // en premier â€” c'est elle qui peuple `flotte` depuis `dts`).
   migrerStructuration(ss);
-  // evenements : jamais d'entete, mais une colonne vide tient lieu de tete
-  // de fichier — on ne pose une ligne d'exemple QUE si la feuille est vide.
+  // evenements : ENTETE en ligne 1 (figee), donnees a partir de la ligne 2.
+  // Sans entete, le sheet etait illisible (9 colonnes sans titres) ; avec un
+  // entete mal geree, la ligne de titres deviendrait un evenement fantome.
+  // Les lectures/ecritures sont donc decalees explicitement (voir
+  // `LIGNE_DEBUT_EVENEMENTS`).
   if (!ss.getSheetByName(CONFIG.ONGLETS.EVENEMENTS)) {
     const sh = ss.insertSheet(CONFIG.ONGLETS.EVENEMENTS);
-    // Pas d'entete ecrite : la ligne 1 accueillera le premier evenement.
-    sh.getRange(1, 1, 1, COLONNES_EVENEMENTS.length).setBackground('#f3f3f3');
+    sh.getRange(1, 1, 1, COLONNES_EVENEMENTS.length)
+      .setValues([COLONNES_EVENEMENTS]).setFontWeight('bold')
+      .setBackground('#f3f3f3');
+    sh.setFrozenRows(1);
   } else {
     const sh = ss.getSheetByName(CONFIG.ONGLETS.EVENEMENTS);
-    if (sh.getLastRow() === 0) {
-      sh.getRange(1, 1, 1, COLONNES_EVENEMENTS.length).setBackground('#f3f3f3');
+    // ENTETE PHYSIQUE : completer la ligne 1 jusqu'a COLONNES_EVENEMENTS.
+    // Sans cela, un onglet cree avant l'ajout des colonnes perle (27/10)
+    // restait a 10 titres alors que les ecritures en posaient 18.
+    try {
+      const largeur = sh.getLastColumn();
+      if (largeur < COLONNES_EVENEMENTS.length) {
+        sh.getRange(1, 1, 1, COLONNES_EVENEMENTS.length)
+          .setValues([COLONNES_EVENEMENTS]).setFontWeight('bold')
+          .setBackground('#f3f3f3');
+        sh.setFrozenRows(1);
+        journal('MIGRATION entete evenements : ' +
+                COLONNES_EVENEMENTS.length + ' colonnes');
+      }
+    } catch (_) { /* entete illisible : on ne bloque pas l'ecriture */ }
+    // Onglet deja rempli par des evenements SANS entete : on ne decale RIEN
+    // de force (les donnees existantes resteraient en ligne 1 et seraient
+    // lues comme un event_id invalide). On signale seulement.
+    const premiere = sh.getLastRow() > 0
+      ? String(sh.getRange(1, 1).getValue())
+      : '';
+    if (!premiere || /^[0-9a-f-]{36}$/i.test(premiere)) {
+      Logger.log('evenements : entete absente (ligne 1 = donnee). ' +
+                 'Lancer migrationEnteteEvenements() pour la poser.');
     }
   }
 
@@ -178,7 +251,7 @@ function initialiser() {
     // colonnes du schema manquent a la suite (ex. `cartes` passe de 2 a 8
     // colonnes). On n'ecrase JAMAIS une colonne existante : les donnees en
     // place restent alignees sur leur entete. Aucune ligne de donnee n'est
-    // touchee — on n'ecrit que la ligne 1.
+    // touchee â€” on n'ecrit que la ligne 1.
     const actuels = sh.getLastColumn()
       ? sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0]
           .map((v) => String(v).trim())
@@ -206,6 +279,61 @@ function initialiserOnglets() {
   Logger.log('Onglets verifies : ' + Object.values(CONFIG.ONGLETS).join(', '));
 }
 
+/**
+ * Pose l'entete de l'onglet `evenements` sur un onglet deja rempli.
+ *
+ * Menu Run ▶ migrationEnteteEvenements.
+ *
+ * Insere une ligne en tete et y ecrit les 9 titres ; les donnees existantes
+ * descendent d'une ligne (lignes 1..N deviennent 2..N+1) sans aucune
+ * modification de leur contenu. Idempotente : si la ligne 1 est deja un
+ * UUID, elle sort immediatement ; si une entete est deja posee, aussi.
+ *
+ * Sans cette fonction, ajouter l'entete a la main decalerait la detection
+ * d'idempotence (`ligneDebutEvenements` lit la ligne 1 pour savoir si une
+ * entete est presente).
+ */
+function migrationEnteteEvenements() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const sh = ss.getSheetByName(CONFIG.ONGLETS.EVENEMENTS);
+  if (!sh) { Logger.log('Onglet evenements absent.'); return 'absent'; }
+  if (sh.getLastRow() === 0) {
+    sh.getRange(1, 1, 1, COLONNES_EVENEMENTS.length)
+      .setValues([COLONNES_EVENEMENTS]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+    Logger.log('Onglet vide : entete posee.');
+    return 'entete posee (vide)';
+  }
+  const premiere = String(sh.getRange(1, 1).getValue()).trim();
+  if (!/^[0-9a-f-]{36}$/i.test(premiere)) {
+    // Entete deja presente : on COMPLETE si elle n'a pas encore la colonne
+    // `elevation` (ajout du 22/10). On n'ecrase jamais un titre existant.
+    const actuels = sh.getRange(1, 1, 1, Math.max(1, sh.getLastColumn()))
+      .getValues()[0].map((v) => String(v).trim());
+    const manquants = COLONNES_EVENEMENTS.slice(actuels.length);
+    if (manquants.length) {
+      sh.getRange(1, actuels.length + 1, 1, manquants.length)
+        .setValues([manquants]).setFontWeight('bold');
+      const r = 'entete complete : ' + manquants.join(', ');
+      journal('MIGRATION ' + r);
+      Logger.log(r);
+      return r;
+    }
+    Logger.log('Entete deja presente en ligne 1 : ' + premiere);
+    return 'deja presente';
+  }
+  // Insertion d'une ligne vide en 1 : les donnees descendent, intactes.
+  sh.insertRowBefore(1);
+  sh.getRange(1, 1, 1, COLONNES_EVENEMENTS.length)
+    .setValues([COLONNES_EVENEMENTS]).setFontWeight('bold')
+    .setBackground('#f3f3f3');
+  sh.setFrozenRows(1);
+  const rapport = 'entete posee, ' + (sh.getLastRow() - 1) + ' evenement(s) decale(s)';
+  journal('MIGRATION ' + rapport);
+  Logger.log(rapport);
+  return rapport;
+}
+
 // ============================================================
 //  ROUTEUR
 // ============================================================
@@ -219,9 +347,13 @@ function doGet(e) {
       case 'affectation':  return affectationLire();
       case 'blasts':       return blastsLire();
       case 'referentiels': return referentielsLire();
+      case 'plans':        return plansInventaire();
       case 'plan':         return planServir(p.carte || '');
       case 'sante':        return sante();
+      case 'migrer':       return migrationExecuter();
+      case 'diagnostic':   return referentielsDiagnostic();
       case 'notifications': return notificationsLire(p.depuis);
+      case 'donnees':      return donneesLire(p.onglet);
       default:
         return corps(false, 'action inconnue : ' + (p.action || '(absente)'));
     }
@@ -230,14 +362,19 @@ function doGet(e) {
 
 function doPost(e) {
   return reponse(function () {
-    initialiser(); // cree les onglets manquants (idempotent, leger)
     const p = e.parameter || {};
     verifierToken(p.token);
     if (p.action === 'evenement') {
+      // CHEMIN CHAUD : aucun initialiser() ici. L'ecriture d'un evenement
+      // ne cree aucun onglet ; initialiser a chaque GPS (5 s) faisait
+      // depasser le delai d'Apps Script (302 sans corps, file bloquee).
       return evenementTraiter(e.postData ? e.postData.contents : '');
     }
     if (p.action === 'notification') {
       return notificationEcrire(e.postData ? e.postData.contents : '');
+    }
+    if (p.action === 'donnees') {
+      return donneesEcrire(e.postData ? e.postData.contents : '');
     }
     return corps(false, 'action POST inconnue : ' + (p.action || '(absente)'));
   });
@@ -248,7 +385,7 @@ function reponse(traitement, binairePossible) {
   try {
     const valeur = traitement();
     // ContentService n'est pas une fonction constructeur : `instanceof` sur le
-    // global jette « Right-hand side of 'instanceof' is not callable ». On
+    // global jette Â« Right-hand side of 'instanceof' is not callable Â». On
     // reconnait un TextOutput deja construit (reponse binaire/plan) a sa forme.
     if (valeur && typeof valeur.getContent === 'function' && typeof valeur !== 'string') {
       return valeur;
@@ -269,7 +406,7 @@ function ReponseBinaire(sortie) { this.sortie = sortie; }
 
 /** Corps JSON standard : tout passe par le marqueur ok. */
 function corps(ok, ...champs) {
-  // corps(true, {cle: valeur}) ou corps(false, 'message') — les deux formes.
+  // corps(true, {cle: valeur}) ou corps(false, 'message') â€” les deux formes.
   if (typeof ok !== 'object' && champs.length === 1 && typeof champs[0] === 'string') {
     return { ok: ok, erreur: champs[0] };
   }
@@ -279,7 +416,7 @@ function corps(ok, ...champs) {
 }
 
 // ============================================================
-//  AUTH — jeton en parametre de requete (en-tetes invisibles sur GAS)
+//  AUTH â€” jeton en parametre de requete (en-tetes invisibles sur GAS)
 // ============================================================
 
 function verifierToken(recu) {
@@ -289,7 +426,7 @@ function verifierToken(recu) {
 }
 
 // ============================================================
-//  SPREADSHEET — acces aux onglets
+//  SPREADSHEET â€” acces aux onglets
 // ============================================================
 
 function feuille(nom) {
@@ -337,13 +474,137 @@ function lireTable(nom) {
 }
 
 // ============================================================
-//  POST /evenements — file d'entree (CDC §3)
+//  SYNCHRONISATION GENERIQUE â€” GET/POST ?action=donnees
+// ============================================================
+//
+//  Lecture et ecriture d'un onglet synchronisable, designe par son nom de
+//  CONTRAT (identique a celui utilise par le serveur local) :
+//
+//      GET  ?action=donnees&onglet=flotte
+//           -> { ok, onglet, nom_onglet, entete:[...], lignes:[{...}] }
+//
+//      POST ?action=donnees
+//           corps JSON : { onglet, lignes:[{...}] }
+//           -> { ok, onglet, ecrites:N }
+//
+//  Le jeton reste dans la query string (le corps ne sert qu'a la charge
+//  utile) : c'est la meme convention que les autres actions.
+
+/** Onglets synchronisables : nom de contrat -> cle de CONFIG.ONGLETS. */
+const ONGLETS_SYNC = {
+  profils: 'PROFILS',
+  identifiants: 'IDENTIFIANTS',
+  flotte: 'FLOTTE',
+  positions: 'POSITIONS',
+  affectation: 'AFFECTATION',
+  tab: 'TAB',
+  equipements: 'EQUIPEMENTS',
+};
+
+/** Colonnes forcees en texte brut (chaines qui ressemblent a des nombres). */
+const COLONNES_TEXTE_SYNC = {
+  flotte: ['famille', 'numero'],
+  identifiants: ['id'],
+  profils: ['code'],
+  positions: ['code'],
+  tab: ['id'],
+  equipements: ['id'],
+};
+
+/** Resout un nom de contrat en nom d'onglet reellement present. */
+function nomOngletSync(contrat) {
+  const cle = ONGLETS_SYNC[String(contrat || '').trim().toLowerCase()];
+  if (!cle) return '';
+  return CONFIG.ONGLETS[cle] || '';
+}
+
+/** Entete brute d'un onglet (liste de chaines). */
+function lireEntete(nom) {
+  const sh = feuille(nom);
+  if (!sh.getLastColumn()) return [];
+  return sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0]
+      .map(v => String(v).trim());
+}
+
+/** GET ?action=donnees&onglet=X : lecture brute d'un onglet synchronisable. */
+function donneesLire(contrat) {
+  const nom = nomOngletSync(contrat);
+  if (!nom) return corps(false, 'onglet non synchronisable : ' + (contrat || '(absent)'));
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  if (!ss.getSheetByName(nom)) return corps(false, 'onglet manquant : ' + nom);
+  return corps(true, {
+    onglet: String(contrat).trim(),
+    nom_onglet: nom,
+    entete: lireEntete(nom),
+    lignes: lireTable(nom),
+  });
+}
+
+/** POST ?action=donnees : ecriture complete d'un onglet synchronisable. */
+function donneesEcrire(brut) {
+  let p = {};
+  try { p = JSON.parse(brut || '{}'); } catch (_) { return corps(false, 'corps illisible (JSON attendu)'); }
+  const contrat = String(p.onglet || '').trim().toLowerCase();
+  const nom = nomOngletSync(contrat);
+  if (!nom) return corps(false, 'onglet non synchronisable : ' + (contrat || '(absent)'));
+  const lignes = Array.isArray(p.lignes) ? p.lignes : [];
+
+  // `affectation` est un onglet cle/valeur : on NE le reecrit pas (le
+  // parcours calcule et `valide_le` seraient perdus), on met a jour les
+  // cles fournies et on laisse les autres intactes.
+  if (contrat === 'affectation') {
+    return ecrireAffectationCles(nom, lignes);
+  }
+
+  const entete = (SCHEMAS[contrat] && SCHEMAS[contrat].length)
+    ? SCHEMAS[contrat]
+    : lireEntete(nom);
+  if (!entete.length) return corps(false, 'entete de l\'onglet illisible : ' + nom);
+
+  const valeurs = lignes.map((l) => entete.map((col) => valeurCellule(l, col)));
+  ecrireTable(nom, entete, valeurs, COLONNES_TEXTE_SYNC[contrat] || []);
+  return corps(true, { onglet: contrat, nom_onglet: nom, ecrites: valeurs.length });
+}
+
+/** Valeur d'une cellule, normalisee pour Sheets (booleens, nombres, texte). */
+function valeurCellule(ligne, col) {
+  let v = (ligne && typeof ligne === 'object') ? ligne[col] : ligne;
+  if (v === undefined || v === null) v = '';
+  if (col === 'actif') {
+    if (typeof v === 'boolean') return v;
+    if (typeof v === 'number') return v !== 0;
+    return /^(1|true|oui|yes|vrai|actif)$/i.test(String(v).trim());
+  }
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'number') return v;
+  return String(v);
+}
+
+/** Ecriture partielle de l'onglet cle/valeur `affectation`. */
+function ecrireAffectationCles(nom, lignes) {
+  const fusion = lireCleValeur(nom);
+  for (const l of lignes) {
+    const cle = String((l && l.cle) || '').trim();
+    if (!cle) continue;
+    fusion[cle] = (l.valeur === undefined || l.valeur === null) ? '' : l.valeur;
+  }
+  const cles = Object.keys(fusion);
+  ecrireTable(nom, SCHEMAS.affectation, cles.map(k => [k, fusion[k]]), []);
+  return corps(true, { onglet: 'affectation', nom_onglet: nom, ecrites: lignes.length });
+}
+
+// ============================================================
+//  POST /evenements â€” file d'entree (CDC Â§3)
 // ============================================================
 
-/** Types d'evenements acceptes (CDC §3.2). */
+/** Types d'evenements acceptes (CDC Â§3.2). */
 const TYPES_ACCEPTES = [
   'GPS_UPDATE', 'LINE_ADD', 'BLAST_LOCK',
-  'BLAST_UNLOCK', 'BLAST_SEND', 'BLE_RELAY',
+  'BLAST_UNLOCK', 'BLAST_SEND', 'BLE_RELAY',
+  // Position du godet (perle) et sa moyenne de session, emises par
+  // l'ecran Excavator. OUBLIEES ici : le serveur les refusait en 400,
+  // la tablette les renvoyait sans fin et la file grossissait (27/10).
+  'POSITION_PERLE', 'MOYENNE_PERLE',
 ];
 
 /**
@@ -362,7 +623,7 @@ function evenementTraiter(brut) {
     return corps(false, 'enveloppe absente');
   }
   if (enveloppe.vers_protocole && enveloppe.vers_protocole !== CONFIG.VERSION_PROTOCOLE) {
-    // Regle CDC §2 adaptee : le protocole est verifie dans le corps.
+    // Regle CDC Â§2 adaptee : le protocole est verifie dans le corps.
     return corps(false, 'protocole refuse : ' + enveloppe.vers_protocole);
   }
 
@@ -378,20 +639,37 @@ function evenementTraiter(brut) {
     return corps(false, 'payload manquant pour ' + type);
   }
   if (type === 'GPS_UPDATE' && !payloadGpsValide(enveloppe.payload)) {
-    return corps(false, 'GPS_UPDATE sans easting/northing valides');
+    return corps(false, 'GPS_UPDATE sans easting/northing valides');
+  if (type === 'POSITION_PERLE' && !payloadPerleValide(enveloppe.payload)) {
+    return corps(false, 'POSITION_PERLE sans xbloc/ybloc/zbloc valides');
+  }
+  if (type === 'MOYENNE_PERLE' && !payloadMoyenneValide(enveloppe.payload)) {
+    return corps(false, 'MOYENNE_PERLE sans xmoy/ymoy/zmoy valides');
+  }
   }
 
   const sh = feuille(CONFIG.ONGLETS.EVENEMENTS);
   const verrou = LockService.getScriptLock();
-  // Un client repondant en < 1 s : 30 s de lock suffisent et protegent
-  // deux tablettes qui poussent au meme instant.
-  verrou.waitLock(30000);
+  // Un client repondant en < 1 s : 5 s de lock suffisent et protegent
+  // deux tablettes qui poussent au meme instant. 30 s depassait le delai
+  // de reponse d'Apps Script : la Web App repondait par une REDIRECTION 302
+  // (vers script.googleusercontent.com) que le client ne sait pas suivre —
+  // il croyait a un echec et gardait l'evenement en file, alors que
+  // l'ecriture avait bien eu lieu (observe 22/10 : 174 evenements bloques).
+  verrou.waitLock(5000);
   try {
+    const debut = ligneDebutEvenements(sh);
     const dernieres = sh.getLastRow();
+    const totalDonnees = Math.max(0, dernieres - debut + 1);
     // Idempotence (REQ-015) : balayage des event_ids existants. La colonne A
-    // est l'event_id ; on plafonne le balayage aux dernieres lignes pour que
-    // le cout reste constant au fil des mois.
-    const profondeur = Math.min(dernieres, 2000);
+    // est l'event_id. Profondeur 200 au lieu de 2000 : un doublon survient
+    // quelques secondes apres l'original (le client rejoue des qu'un ACK
+    // manque), donc il est toujours dans les 200 dernieres lignes. Lire 2000
+    // lignes a chaque envoi faisait depasser le delai de reponse et
+    // declenchait la redirection 302 — c'est la cause premiere du blocage.
+    // Au pire, un doublon tres ancien passe : une ligne en double dans le
+    // sheet, jamais une perte d'evenement.
+    const profondeur = Math.min(totalDonnees, 200);
     if (profondeur > 0) {
       const ids = sh.getRange(dernieres - profondeur + 1, 1, profondeur, 1).getValues();
       for (const ligne of ids) {
@@ -404,17 +682,75 @@ function evenementTraiter(brut) {
     }
 
     // Ecriture : une ligne par evenement, payload en texte brut.
-    sh.appendRow([
+    // `getRange(...).setValues()` plutot qu'`appendRow` : appendRow ecrit
+    // toujours APRES la derniere ligne remplie, ce qui est correct ici, mais
+    // setValues rend la ligne visee explicite (et evite une ligne vide
+    // intercalaires quand une colonne est laissee vide).
+    // ECRITURE EXPLICITE SUR LA LIGNE VISEE (27/10).
+    //
+    // ppendRow ecrivait a la premiere ligne vide de la FEUILLE, sans
+    // garantir que l'entete physique faisait 18 colonnes. Consequence au
+    // terrain : les lignes se decalaient, easting/northing/elevation
+    // tombaient dans les colonnes du godet et inversement.
+    //
+    // On ecrit donc sur getLastRow() + 1 avec la largeur EXACTE de
+    // [COLONNES_EVENEMENTS] : une ligne = un evenement, toujours aligne.
+    //
+    // Les cellules non concernees restent VIDEES (''), jamais mises a 0 :
+    // Number(x) || 0 remplissait chaque colonne inutilisee d'un zero, si
+    // bien qu'on ne pouvait plus distinguer Â« pas de valeur Â» de Â« valeur
+    // nulle Â» a la lecture du sheet.
+    const valeurs = [
       id,
       String(enveloppe.gateway_id || ''),
       String(enveloppe.source_device || ''),
       type,
       String(enveloppe.timestamp || ''),
-      maintenant(),                              // received_at (CDC §3.4)
-      JSON.stringify(enveloppe.payload),
+      maintenant(),                              // received_at (CDC Â§3.4)
+      // PAYLOAD SANS LA PHOTO (27/10).
+      //
+      // Une photo JPEG en base64 depasse 50 000 caracteres des qu'elle a une
+      // taille terrain : Google Sheets REFUSE alors la cellule et l'evenement
+      // n'est jamais enregistre (Â« Exception: votre saisie depasse le nombre
+      // maximum de 50000 caracteres autorise par cellule Â»). Les LINE_ADD et
+      // BLAST_SEND avec photo echouaient donc en silence.
+      //
+      // La photo part dans une colonne DEDIEE, decoupee en morceaux de
+      // 45 000 caracteres (colonnes photo, photo_2, photo_3...). Le
+      // payload garde tout le reste et un simple drapeau photo_tronquee.
+      JSON.stringify(payloadSansPhoto(enveloppe.payload)),
+      // Position de la TABLETTE (GPS_UPDATE uniquement).
       type === 'GPS_UPDATE' ? Number(enveloppe.payload.easting) || '' : '',
       type === 'GPS_UPDATE' ? Number(enveloppe.payload.northing) || '' : '',
-    ]);
+      type === 'GPS_UPDATE' ? Number(enveloppe.payload.elevation) || '' : '',
+      // Position du GODET (POSITION_PERLE uniquement), en coordonnees de bloc.
+      type === 'POSITION_PERLE' ? Number(enveloppe.payload.xbloc) || '' : '',
+      type === 'POSITION_PERLE' ? Number(enveloppe.payload.ybloc) || '' : '',
+      type === 'POSITION_PERLE' ? Number(enveloppe.payload.zbloc) || '' : '',
+      // Moyenne de session (MOYENNE_PERLE uniquement).
+      type === 'MOYENNE_PERLE' ? Number(enveloppe.payload.xmoy) || '' : '',
+      type === 'MOYENNE_PERLE' ? Number(enveloppe.payload.ymoy) || '' : '',
+      type === 'MOYENNE_PERLE' ? Number(enveloppe.payload.zmoy) || '' : '',
+      type === 'MOYENNE_PERLE' ? Number(enveloppe.payload.nombre) || '' : '',
+      (type === 'POSITION_PERLE' || type === 'MOYENNE_PERLE')
+        ? String(enveloppe.payload.dt || '') : '',
+    ];
+    // Ligne visee : la premiere libre APRES l'entete. getLastRow() rend la
+    // derniere ligne utilisee ; +1 ne peut donc jamais recouvrir une donnee.
+    const ligneVisee = sh.getLastRow() + 1;
+    // PHOTO : colonnes suivantes, par morceaux (voir [morceauxPhoto]).
+    for (const morceau of morceauxPhoto(enveloppe.payload)) {
+      valeurs.push(morceau);
+    }
+    // Garde-fou final : une valeur hors limite ferait echouer TOUTE la ligne.
+    // On la remplace par un marqueur plutot que de perdre l'evenement.
+    const valeursSure = valeurs.map(function (v) {
+      const t = String(v === null || v === undefined ? '' : v);
+      return t.length > 49000
+        ? '[valeur trop volumineuse : ' + t.length + ' caracteres]'
+        : v;
+    });
+    sh.getRange(ligneVisee, 1, 1, valeursSure.length).setValues([valeursSure]);
     journal('EVENT ' + type + ' ' + id + ' de ' + (enveloppe.source_device || '?'));
     return corps(true, {
       ack: { event_id: id, status: 'SYNCED', received_at: maintenant() },
@@ -424,20 +760,63 @@ function evenementTraiter(brut) {
   }
 }
 
-/** GPS_UPDATE exige easting et northing numeriques (CDC §3.2). */
+/** GPS_UPDATE exige easting et northing numeriques (CDC Â§3.2). */
+/** POSITION_PERLE exige xbloc, ybloc et zbloc numeriques. */
+/** Copie du payload SANS le champ photo (trop volumineux pour une cellule). */
+function payloadSansPhoto(payload) {
+  const copie = {};
+  if (!payload || typeof payload !== 'object') return copie;
+  for (const cle in payload) {
+    if (cle === 'photo') continue;
+    copie[cle] = payload[cle];
+  }
+  // Signale que la photo existe ailleurs, sans la dupliquer.
+  if (payload.photo) copie.photo_separee = true;
+  return copie;
+}
+
+/**
+ * Decoupe la photo base64 en morceaux de 45 000 caracteres au plus.
+ *
+ * Une cellule Sheets plafonne a 50 000 : on garde de la marge. Rend une
+ * liste vide s'il n'y a pas de photo, ce qui laisse les colonnes suivantes
+ * vides sans decaler les autres lignes.
+ */
+function morceauxPhoto(payload) {
+  const photo = payload && payload.photo ? String(payload.photo) : '';
+  if (!photo) return [];
+  const TAILLE = 45000;
+  const morceaux = [];
+  for (let i = 0; i < photo.length && morceaux.length < 8; i += TAILLE) {
+    morceaux.push(photo.substring(i, i + TAILLE));
+  }
+  return morceaux;
+}
+
+function payloadPerleValide(p) {
+  return p && isFinite(Number(p.xbloc)) && isFinite(Number(p.ybloc)) &&
+         isFinite(Number(p.zbloc));
+}
+
+/** MOYENNE_PERLE exige xmoy, ymoy et zmoy numeriques (nombre facultatif). */
+function payloadMoyenneValide(p) {
+  return p && isFinite(Number(p.xmoy)) && isFinite(Number(p.ymoy)) &&
+         isFinite(Number(p.zmoy));
+}
+
 function payloadGpsValide(p) {
   const e = Number(p.easting), n = Number(p.northing);
   return isFinite(e) && isFinite(n) && e !== 0 && n !== 0;
 }
 
 // ============================================================
-//  GET /affectation — mission en cours (CDC §4)
+//  GET /affectation â€” mission en cours (CDC Â§4)
 // ============================================================
 
 /**
  * Repond 200 (ok:true) avec l'affectation, ou affectation vide si aucune
  * mission (equivalent 404 du CDC : le client n'ecrit rien).
- * Le parcours est renvoye A CHAQUE APPEL (regle §4.4) : il vient du cache
+ * Le parcours est renvoye A CHAQUE APPEL (regle Â§4.4) : il vient du cache
  * s'il est frais, sinon il est recalcule depuis la position connue du DT.
  */
 function affectationLire() {
@@ -489,7 +868,7 @@ function ecrireValeurAffectation(cle, valeur) {
 }
 
 // ============================================================
-//  PARCOURS — plus court chemin vers la dumping area (CDC §4.5)
+//  PARCOURS â€” plus court chemin vers la dumping area (CDC Â§4.5)
 // ============================================================
 
 function cacheParcours() {
@@ -590,7 +969,7 @@ function dijkstra(graphe, depart, arrivee) {
 }
 
 // ============================================================
-//  GET /blasts — liste des blasts du site (contrat client §2)
+//  GET /blasts â€” liste des blasts du site (contrat client Â§2)
 // ============================================================
 
 /**
@@ -611,12 +990,14 @@ function referentielsLire() {
         actif: p.actif === true || String(p.actif).toLowerCase() === 'true' || Number(p.actif) === 1 ? 1 : 0,
       }))
       .filter((p) => p.code && p.libelle && p.role_cdc);
-  // Identifiants proposes au login (tablette/boite, camion, spotter...).
+  // Identifiants proposes au login (personnes equipes de spotters).
   const equipements = lireTable(CONFIG.ONGLETS.IDENTIFIANTS)
       .map((e) => ({
         profil: String(e.profil || '').trim(),
         id: String(e.id || '').trim(),
         nom: String(e.nom || '').trim(),
+        role: String(e.role || '').trim(),
+        equipe: String(e.equipe || '').trim(),
         actif: e.actif === true || String(e.actif).toLowerCase() === 'true' || Number(e.actif) === 1 ? 1 : 0,
       }))
       .filter((e) => e.profil && e.id);
@@ -626,27 +1007,54 @@ function referentielsLire() {
   // pas le nom de l'onglet cote Spreadsheet.
   const dts = lireTable(CONFIG.ONGLETS.FLOTTE)
       .map((d) => ({
+        // `role` = profil propriétaire de la famille (DT, EXCAVATOR...) —
+        // c'est la JOINTURE que le client applique, sans deduction.
+        role: String(d.role || '').trim(),
         type: String(d.famille || '').trim(),
         id: String(d.numero || '').trim(),
         actif: d.actif === true || String(d.actif).toLowerCase() === 'true' || Number(d.actif) === 1 ? 1 : 0,
       }))
       .filter((d) => d.type && d.id);
 
-  // Un snapshot vide ou mal formé ne doit jamais être interprété comme une
-  // commande d'effacement par les tablettes.
+  // CohÃ©rence :
+  //   - profils uniques ;
+  //   - UNIQUE(famille, numero) pour la flotte (785/1 et 1500/1 coexistent) ;
+  //   - strict : chaque profil MACHINE actif a au moins un engin flotte
+  //     ACTIF de sa famillle â€” sinon les tablettes concernÃ©es ne peuvent
+  //     pas se connecter du tout ;
+  //   - tolÃ¨re : SPOT sans membres (phase d'installation des Ã©quipes).
   const codesProfils = profils.map((p) => p.code);
-  const types = [...new Set(dts.map((d) => d.type))];
-  const cleEquipements = equipements.map((e) => e.profil + '::' + e.id);
-  const idsDt = dts.map((d) => d.id);
-  const equipementsActifs = new Set(equipements.filter((e) => e.actif).map((e) => e.profil));
-  const idsDtActifs = new Set(dts.filter((d) => d.actif).map((d) => d.type));
-  if (!profils.length || !equipements.length || !types.length ||
+  // Familles d'un profil = celles que la FLOTTE lui rattache via `role`.
+  // AUCUNE liste en dur : la base est la seule source de verite.
+  const famillesParRole = dts.reduce((acc, d) => {
+    const r = String(d.role || '').trim().toUpperCase();
+    if (r) (acc[r] = acc[r] || new Set()).add(String(d.type).trim().toUpperCase());
+    return acc;
+  }, {});
+  const enginsActifsParFamille = new Set(
+    dts.filter((d) => d.actif).map((d) => String(d.type).trim().toUpperCase()));
+  // Le profil personne porte role_cdc = 'SPOTTER' (code SPOT) : le comparer
+  // strictement a 'SPOT' le classait machine et le refus etait systematique.
+  const PROFIL_MACHINE = (p) => {
+    const role = String(p.role_cdc || '').trim().toUpperCase();
+    return role !== '' && !role.includes('SPOT');
+  };
+  const manqueMachine = profils.filter((p) => {
+    if (!PROFIL_MACHINE(p) || !p.actif) return false;
+    const role = String(p.role_cdc || '').trim().toUpperCase();
+    const familles = (famillesParRole[role] ||
+                      famillesParRole[String(p.code).trim().toUpperCase()] || new Set());
+    // Le profil machine est valide s'il possede AU MOINS une famille
+    // flotte, et que cette famille a un engin actif.
+    return [...familles].every((f) => !enginsActifsParFamille.has(f));
+  });
+  const manquePersonne = profils.filter((p) =>
+    !PROFIL_MACHINE(p) && p.actif &&
+    !equipements.some((e) => e.profil === p.code && e.actif));
+  if (!profils.length ||
       new Set(codesProfils).size !== profils.length ||
-      equipements.some((e) => !codesProfils.includes(e.profil)) ||
-      new Set(cleEquipements).size !== equipements.length ||
-      new Set(idsDt).size !== idsDt.length ||
-      types.some((type) => !idsDtActifs.has(type)) ||
-      profils.some((p) => p.actif && !equipementsActifs.has(p.code))) {
+      new Set(dts.map((d) => d.type + '::' + d.id)).size !== dts.length ||
+      manqueMachine.length) {
     return corps(false, 'referentiels absents ou incoherents');
   }
   // La cle JSON reste `equipements` : les tablettes deja deployees lisent
@@ -656,10 +1064,15 @@ function referentielsLire() {
     profils: profils,
     equipements: equipements,
     dts: dts,
+    // Info, pas un refus : les spotters seront crees/cadres par l'app.
+    avertissements: manquePersonne.length
+      ? ['profil sans membre actif : ' +
+         manquePersonne.map((p) => p.code).join(', ')]
+      : [],
   });
 }
 
-/** Compare deux numeros de blast (« 106 », « 232.5 ») numeriquement. */
+/** Compare deux numeros de blast (Â« 106 Â», Â« 232.5 Â») numeriquement. */
 function comparerNumeros(a, b) {
   const na = Number(a), nb = Number(b);
   if (isFinite(na) && isFinite(nb) && na !== nb) return na - nb;
@@ -777,7 +1190,7 @@ function baseUrl() {
 }
 
 // ============================================================
-//  GET /plan — streaming du JPG de la carte depuis Drive
+//  GET /plan â€” streaming du JPG de la carte depuis Drive
 // ============================================================
 
 /**
@@ -786,10 +1199,160 @@ function baseUrl() {
  * Apps Script ne sait PAS streamer un binaire via ContentService (addBlob
  * n'existe pas sur TextOutput). On renvoie donc au client l'URL publique
  * `drive.google.com/uc?export=download&id=<fileId>`, qu'il telecharge en
- * HTTP direct — sans passer par la Web App.
+ * HTTP direct â€” sans passer par la Web App.
  *
  * Rend '' si le fichier n'existe pas dans le dossier (le caller retombe
  * alors sur l'URL Apps Script, qui signalera l'absence).
+ */
+// ============================================================
+//  Inventaire des plans (Maps) du dossier Drive
+// ============================================================
+/**
+ * Ouvre le dossier des plans et rend le Folder, ou leve une erreur explicite.
+ *
+ * Le point sensible : un dossier partage A UNE ADRESSE donnee est lisible en
+ * HTTP, mais DriveApp exige que le compte qui execute le script figure parmi
+ * les personnes autorisees (ou que le partage soit public). D'ou de vrais
+ * messages au lieu d'un catch muet.
+ */
+function ouvrirDossierPlans() {
+  return DriveApp.getFolderById(CONFIG.DOSSIER_PLANS_ID);
+}
+
+/** Vrai si le nom correspond a un fichier image exploitable comme plan. */
+function estFichierPlan(nom) {
+  return /\.(jpe?g|png|gif|webp|bmp)$/i.test(String(nom || ''));
+}
+
+/** Code de carte deduit du nom de fichier (sans extension ni prefixe plan_). */
+function codeCarteDepuisNom(nom) {
+  let n = String(nom || '').trim();
+  const point = n.lastIndexOf('.');
+  if (point > 0) n = n.substring(0, point);
+  if (n.toLowerCase().indexOf('plan_') === 0) n = n.substring(5);
+  return n.trim();
+}
+
+/**
+ * GET ?action=plans : liste EXHAUSTIVE du dossier.
+ *
+ * Reponse : { ok:true, dossier:<id>, nombre:<n>,
+ *             plans:[{carte, id, nom, url}] }
+ *
+ * ok:false protege le poste : le client ne supprime rien et ne telecharge
+ * rien quand l'inventaire n'est pas sur. Une liste VIDE, au contraire, est
+ * une information : le dossier est vide, la tablette purge ses plans.
+ */
+function plansInventaire() {
+  let dossier;
+  try {
+    dossier = ouvrirDossierPlans();
+  } catch (e) {
+    return corps(false,
+      'dossier plans inaccessible : ' + (e && e.message ? e.message : e) +
+      ' - partagez le dossier avec l\'adresse qui execute la Web App ' +
+      '(au moins Lecteur), ou avec toute personne disposant du lien');
+  }
+  const plans = [];
+  try {
+    const fichiers = dossier.getFiles();
+    while (fichiers.hasNext()) {
+      const f = fichiers.next();
+      const nom = f.getName();
+      if (!estFichierPlan(nom)) continue;
+      const id = f.getId();
+      plans.push({
+        carte: codeCarteDepuisNom(nom),
+        id: id,
+        nom: nom,
+        url: 'https://drive.google.com/uc?export=download&confirm=t&id=' + id,
+      });
+    }
+  } catch (e) {
+    return corps(false,
+      'lecture du dossier plans impossible : ' + (e && e.message ? e.message : e));
+  }
+  // Tri stable : deux appels successifs rendent le meme ordre, les journaux
+  // et les diffs restent comparables.
+  plans.sort((a, b) => (a.carte < b.carte ? -1 : (a.carte > b.carte ? 1 : 0)));
+  return corps(true, {
+    dossier: dossier.getId(),
+    nombre: plans.length,
+    plans: plans,
+  });
+}
+
+/**
+ * Etat lisible du dossier des plans, pour l'action sante.
+ * Ex. "OK (12 fichier(s))" ou "INACCESSIBLE : <motif>".
+ */
+function etatDossierPlans() {
+  let dossier;
+  try {
+    dossier = ouvrirDossierPlans();
+  } catch (e) {
+    return 'INACCESSIBLE : ' + (e && e.message ? e.message : e);
+  }
+  let n = 0;
+  const fichiers = dossier.getFiles();
+  while (fichiers.hasNext()) {
+    if (estFichierPlan(fichiers.next().getName())) n++;
+  }
+  return 'OK (' + n + ' fichier(s))';
+}
+
+/**
+ * A executer UNE FOIS depuis l'editeur Apps Script (bouton Executer, puis
+ * menu Journal) : dit en clair qui execute, qui possede le dossier, quels
+ * sont ses droits de partage et quels fichiers y sont.
+ */
+function diagnosticDossierPlans() {
+  const lignes = [];
+  try {
+    lignes.push('Compte executant : ' + Session.getEffectiveUser().getEmail());
+  } catch (e) {
+    lignes.push('Compte executant : (inconnu)');
+  }
+  let dossier;
+  try {
+    dossier = ouvrirDossierPlans();
+  } catch (e) {
+    lignes.push('OUVERTURE : ECHEC');
+    lignes.push('  motif : ' + (e && e.message ? e.message : e));
+    lignes.push('  a faire : partager le dossier avec le compte ci-dessus ' +
+      '(Lecteur minimum), ou avec toute personne disposant du lien');
+    Logger.log(lignes.join('\n'));
+    return lignes.join('\n');
+  }
+  lignes.push('OUVERTURE : OK');
+  lignes.push('  nom     : ' + dossier.getName());
+  lignes.push('  id      : ' + dossier.getId());
+  try { lignes.push('  proprio : ' + dossier.getOwner().getEmail()); }
+  catch (e) { lignes.push('  proprio : (non lisible)'); }
+  try {
+    lignes.push('  partage : ' + dossier.getSharingAccess() +
+      ' / ' + dossier.getSharingPermission());
+  } catch (e) { lignes.push('  partage : (non lisible)'); }
+  const fichiers = dossier.getFiles();
+  let n = 0;
+  const exemples = [];
+  while (fichiers.hasNext()) {
+    const f = fichiers.next();
+    if (!estFichierPlan(f.getName())) continue;
+    if (exemples.length < 10) {
+      exemples.push('  - ' + f.getName() + '  [' + f.getId() + ']');
+    }
+    n++;
+  }
+  lignes.push('PLANS : ' + n);
+  Array.prototype.push.apply(lignes, exemples);
+  Logger.log(lignes.join('\n'));
+  return lignes.join('\n');
+}
+
+/**
+ * URL de telechargement direct d'un plan, ou '' s'il est absent du dossier.
+ * Conserve l'ancien nom urlPlanDrive : d'autres routes s'appuient dessus.
  */
 function urlPlanDrive(carte) {
   if (!carte) return '';
@@ -801,7 +1364,7 @@ function urlPlanDrive(carte) {
       const point = nom.lastIndexOf('.');
       const base = point > 0 ? nom.substring(0, point) : nom;
       if (base !== carte) continue;
-      // Le fichier doit etre partage « Anyone with the link » pour que la
+      // Le fichier doit etre partage Â« Anyone with the link Â» pour que la
       // tablette puisse le telecharger. Si l'acces est restreint, Drive
       // renvoie une page HTML a la place de l'image.
       return 'https://drive.google.com/uc?export=download&id=' + f.getId();
@@ -813,7 +1376,7 @@ function urlPlanDrive(carte) {
 }
 
 // ============================================================
-//  GET /plan — fallback (le client utilise plan_url direct)
+//  GET /plan â€” fallback (le client utilise plan_url direct)
 // ============================================================
 
 /**
@@ -846,7 +1409,7 @@ function mimePlan(nom, mimeDrive) {
 }
 
 // ============================================================
-//  GET /notifications — canal serveur -> spotter (ordre du Boss)
+//  GET /notifications â€” canal serveur -> spotter (ordre du Boss)
 // ============================================================
 
 /**
@@ -872,7 +1435,7 @@ function notificationsLire(depuis) {
 }
 
 /**
- * POST /notification — le Boss (ou un outil admin) depose un message pour
+ * POST /notification â€” le Boss (ou un outil admin) depose un message pour
  * un profil donne. Le spotter le verra au prochain poll.
  * corps JSON : { profil, message } (profil vide = pour tous).
  */
@@ -903,10 +1466,8 @@ function sante() {
   }
   let pistes = 'ok';
   try { DriveApp.getFileById(CONFIG.FICHIER_PISTES_ID).getName(); }
-  catch (_) { pistes = 'INACCESSIBLE'; }
-  let plans = 'ok';
-  try { DriveApp.getFolderById(CONFIG.DOSSIER_PLANS_ID).getName(); }
-  catch (_) { plans = 'INACCESSIBLE'; }
+  catch (_) { pistes = 'INACCESSIBLE'; }  // Etat MESURE (nombre de fichiers ou motif exact de l'echec).
+  const plans = etatDossierPlans();
   return corps(true, {
     service: 'ORE TRACKING serveur',
     protocole: CONFIG.VERSION_PROTOCOLE,
@@ -917,7 +1478,241 @@ function sante() {
   });
 }
 
-/** Trace horodate dans l'onglet journal (audit §3.4). */
+/**
+ * Action `migrer` : applique la migration de structuration (identifiants <-，
+ * equipements, flotte <- dts, tab vide) puis rend le compte rendu.
+ *
+ * Raison d'etre : quand les referentiels en ligne sont incoherents, le seul
+ * correctif est structurel (creer un onglet manquant, deplacer des lignes).
+ * L'operateur ne doit pas avoir a ouvrir l'editeur Apps Script : le SaaS
+ * appelle cette action via /api/gas/migrate.
+ */
+/**
+ * Repare l'onglet evenements : remet l'entete a 18 colonnes et REALIGNE
+ * les lignes existantes d'apres leur payload JSON (source de verite).
+ *
+ * A lancer UNE FOIS depuis l'editeur (menu Executer > reparerEvenements)
+ * apres le correctif du 27/10 : les lignes ecrites avant etaient decalees
+ * (easting dans la colonne du godet, zeros partout ailleurs).
+ *
+ * @return {string} compte rendu
+ */
+/**
+ * Repare l'onglet `evenements` : entete a 18 colonnes, puis REALIGNEMENT
+ * des lignes d'apres leur payload JSON (source de verite).
+ *
+ * A lancer UNE FOIS depuis l'editeur (Executer > reparerEvenements).
+ *
+ * LIMITE GOOGLE SHEETS : une cellule ne depasse pas 50 000 caracteres.
+ * Les evenements LINE_ADD / BLAST_SEND embarquent des PHOTOS en base64 et
+ * depassent couramment cette taille â€” une ecriture en bloc (setValues sur
+ * toute la plage) levait alors Â« Exception: Votre saisie depasse le nombre
+ * maximum de 50000 caracteres autorise par cellule Â» et RIEN n'etait
+ * repare (observe le 27/10).
+ *
+ * D'ou trois precautions :
+ *  - ecriture LIGNE PAR LIGNE, par lots de 200 (quota Apps Script) ;
+ *  - une cellule trop grosse n'est JAMAIS reecrite : on conserve sa valeur
+ *    d'origine (l[6]) â€” le payload reste lisible cote sheet, seule la
+ *    reecriture serait refusee ;
+ *  - une ligne dont une colonne derape est signalee dans le compte rendu,
+ *    plutot que de faire echouer toute la reparation.
+ *
+ * @return {string} compte rendu
+ */
+function reparerEvenements() {
+  const sh = feuille(CONFIG.ONGLETS.EVENEMENTS);
+  const debut = ligneDebutEvenements(sh);
+  const derniere = sh.getLastRow();
+  const n = Math.max(0, derniere - debut + 1);
+
+  // 1. Entete a la bonne largeur (toujours utile, meme sans donnees).
+  sh.getRange(1, 1, 1, COLONNES_EVENEMENTS.length)
+    .setValues([COLONNES_EVENEMENTS]).setFontWeight('bold')
+    .setBackground('#f3f3f3');
+  sh.setFrozenRows(1);
+
+  if (n === 0) {
+    journal('REPARATION evenements : aucune donnee');
+    return 'aucune donnee a realigner';
+  }
+
+  const largeur = Math.max(sh.getLastColumn(), COLONNES_EVENEMENTS.length);
+  const toutes = sh.getRange(debut, 1, n, largeur).getValues();
+  const LIMITE = 49000; // marge sous les 50 000 de Sheets
+
+  let realignees = 0;
+  let conservees = 0;
+  const enEchec = [];
+
+  for (let i = 0; i < toutes.length; i++) {
+    const l = toutes[i];
+    const type = String(l[3] || '');
+    let payload = {};
+    try { payload = JSON.parse(String(l[6] || '{}')); } catch (_) { payload = {}; }
+
+    const num = function (v) {
+      const x = Number(v);
+      return isFinite(x) ? x : '';
+    };
+
+    const ligne = [
+      l[0], l[1], l[2], type, l[4], l[5], l[6],
+      type === 'GPS_UPDATE' ? num(payload.easting) : '',
+      type === 'GPS_UPDATE' ? num(payload.northing) : '',
+      type === 'GPS_UPDATE' ? num(payload.elevation) : '',
+      type === 'POSITION_PERLE' ? num(payload.xbloc) : '',
+      type === 'POSITION_PERLE' ? num(payload.ybloc) : '',
+      type === 'POSITION_PERLE' ? num(payload.zbloc) : '',
+      type === 'MOYENNE_PERLE' ? num(payload.xmoy) : '',
+      type === 'MOYENNE_PERLE' ? num(payload.ymoy) : '',
+      type === 'MOYENNE_PERLE' ? num(payload.zmoy) : '',
+      type === 'MOYENNE_PERLE' ? num(payload.nombre) : '',
+      (type === 'POSITION_PERLE' || type === 'MOYENNE_PERLE')
+        ? String(payload.dt || '') : '',
+    ];
+
+    // Cellule hors limite : on ne reecrit rien pour cette ligne.
+    if (String(ligne[6] || '').length > LIMITE) {
+      conservees++;
+      continue;
+    }
+
+    try {
+      sh.getRange(debut + i, 1, 1, ligne.length).setValues([ligne]);
+      realignees++;
+    } catch (e) {
+      enEchec.push(debut + i + ' (' + (e && e.message ? e.message : e) + ')');
+    }
+
+    // Rendu au quota : on laisse respirer l'execution.
+    if ((i + 1) % 200 === 0) SpreadsheetApp.flush();
+  }
+
+  // Purge des colonnes en trop, seulement si plus personne ne les utilise.
+  if (sh.getLastColumn() > COLONNES_EVENEMENTS.length) {
+    const extra = sh.getRange(1, COLONNES_EVENEMENTS.length + 1, sh.getLastRow(),
+                              sh.getLastColumn() - COLONNES_EVENEMENTS.length)
+                    .getValues();
+    const utilisee = extra.some(function (r) {
+      return r.some(function (v) { return String(v).trim() !== ''; });
+    });
+    if (!utilisee) {
+      sh.deleteColumns(
+        COLONNES_EVENEMENTS.length + 1,
+        sh.getLastColumn() - COLONNES_EVENEMENTS.length
+      );
+    }
+  }
+
+  const rapport = 'REPARATION evenements : ' + realignees + ' ligne(s) ' +
+    'realignee(s), ' + conservees + ' conservee(s) (payload > ' + LIMITE +
+    ' caracteres), ' + enEchec.length + ' en echec' +
+    (enEchec.length ? ' [' + enEchec.slice(0, 5).join(', ') + ']' : '');
+  journal(rapport);
+  Logger.log(rapport);
+  return rapport;
+}
+function migrationExecuter() {
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  const rapport = migrerStructuration(ss, true);
+  journal('migration de structuration : ' + (rapport || 'aucun changement'));
+  return corps(true, {
+    rapport: rapport || 'aucun changement',
+    onglets: etatsOnglets(),
+  });
+}
+
+/**
+ * Action `diagnostic` : pourquoi les referentiels sont-ils refuses ?
+ *
+ * `referentielsLire` ne dit que "referentiels absents ou incoherents".
+ * Ici on detaille : contenu de chaque onglet, doublons et profils sans
+ * machine ou sans membre actif — de quoi corriger le Sheet sans deviner.
+ */
+function referentielsDiagnostic() {
+  const onglets = etatsOnglets();
+  const profils = lireTable(CONFIG.ONGLETS.PROFILS).map((p) => ({
+    code: String(p.code || '').trim(),
+    libelle: String(p.libelle || '').trim(),
+    role_cdc: String(p.role_cdc || '').trim(),
+    actif: p.actif === true || String(p.actif).toLowerCase() === 'true' || Number(p.actif) === 1 ? 1 : 0,
+  })).filter((p) => p.code);
+  const identifiants = lireTable(CONFIG.ONGLETS.IDENTIFIANTS).map((e) => ({
+    profil: String(e.profil || '').trim(),
+    id: String(e.id || '').trim(),
+    nom: String(e.nom || '').trim(),
+    actif: e.actif === true || String(e.actif).toLowerCase() === 'true' || Number(e.actif) === 1 ? 1 : 0,
+  })).filter((e) => e.profil && e.id);
+  const flotte = lireTable(CONFIG.ONGLETS.FLOTTE).map((d) => ({
+    famille: String(d.famille || '').trim(),
+    numero: String(d.numero || '').trim(),
+    actif: d.actif === true || String(d.actif).toLowerCase() === 'true' || Number(d.actif) === 1 ? 1 : 0,
+  })).filter((d) => d.famille && d.numero);
+
+  const FAMILLES_DT = ['1500', '785', 'ADT'];
+  const famillesProfil = (role) => String(role).trim().toUpperCase() === 'DT'
+    ? FAMILLES_DT : [String(role).trim().toUpperCase()];
+  // Meme regle que `referentielsLire` : le profil personne porte
+  // role_cdc = 'SPOTTER' (code SPOT), pas 'SPOT'.
+  const estProfilMachine = (p) => {
+    const role = String(p.role_cdc || '').trim().toUpperCase();
+    return role !== '' && !role.includes('SPOT');
+  };
+  const famillesActives = new Set(
+    flotte.filter((d) => d.actif).map((d) => d.famille.toUpperCase()));
+
+  const codes = profils.map((p) => p.code);
+  const doublonsProfils = codes.filter((c, i) => codes.indexOf(c) !== i);
+  const clesFlotte = flotte.map((d) => d.famille.toUpperCase() + '::' + d.numero);
+  const doublonsFlotte = clesFlotte.filter((c, i) => clesFlotte.indexOf(c) !== i);
+  const lecture = referentielsLire();
+  // La reference de profil d'un engin (DT / EXCAVATOR) n'est pas deducible
+  // de la seule famille : les pelles sont en "EX 1250", "PC 2000"...
+  // `referentielsLire` resout deja ce rattachement ; on reutilise son resultat
+  // plutot que de refaire une deduction approximative (qui donnait un faux
+  // positif sur EXCAVATOR).
+  const profilsCouverts = new Set();
+  if (lecture.ok && lecture.dts) {
+    for (const d of lecture.dts) {
+      const role = String(d.role || '').trim().toUpperCase();
+      if (role && d.actif) profilsCouverts.add(role);
+    }
+  }
+  const sansMachine = profils.filter((p) => estProfilMachine(p) && p.actif &&
+    !profilsCouverts.has(String(p.role_cdc || '').trim().toUpperCase()) &&
+    !famillesProfil(p.role_cdc).some((f) => famillesActives.has(f)));
+  const sansMembre = profils.filter((p) => !estProfilMachine(p) && p.actif &&
+    !identifiants.some((e) => e.profil === p.code && e.actif));
+
+  return corps(true, {
+    onglets: onglets,
+    profils: profils,
+    identifiants: identifiants,
+    flotte: flotte,
+    anomalies: {
+      profils_vides: profils.length === 0,
+      doublons_profils: doublonsProfils,
+      doublons_flotte: doublonsFlotte,
+      profils_sans_machine: sansMachine.map((p) => p.code + ' (' + p.role_cdc + ')'),
+      profils_sans_membre: sansMembre.map((p) => p.code),
+    },
+    referentiels_ok: lecture.ok === true,
+    referentiels_erreur: lecture.erreur || '',
+  });
+}
+
+/** Nombre de lignes par onglet (1 = en-tete seul). */
+function etatsOnglets() {
+  const etats = {};
+  for (const nom of Object.values(CONFIG.ONGLETS)) {
+    try { etats[nom] = feuille(nom).getLastRow(); }
+    catch (_) { etats[nom] = 'MANQUANT'; }
+  }
+  return etats;
+}
+
+/** Trace horodate dans l'onglet journal (audit Â§3.4). */
 function journal(message) {
   try {
     feuille(CONFIG.ONGLETS.JOURNAL).appendRow([maintenant(), message]);
@@ -929,16 +1724,16 @@ function maintenant() {
 }
 
 // ============================================================
-//  AMORCAGE — peuplement initial des onglets depuis le Drive
+//  AMORCAGE â€” peuplement initial des onglets depuis le Drive
 // ============================================================
 //
 //  A executer UNE FOIS a la main depuis l'editeur Apps Script, apres avoir
 //  renseigne SPREADSHEET_ID, TOKEN et DOSSIER_PLANS_ID. C'est le pendant
-//  « donnees » de initialiserOnglets() : celle-ci cree les onglets, celle-la
+//  Â« donnees Â» de initialiserOnglets() : celle-ci cree les onglets, celle-la
 //  les remplit.
 //
 //  PRINCIPE : le dossier Drive est la source de verite. Chaque fichier du
-//  dossier « Map ORE » porte la nomenclature du site en nom de base :
+//  dossier Â« Map ORE Â» porte la nomenclature du site en nom de base :
 //
 //      232.5_OM_LWP2_235_230_106.gif
 //       |    |   |    |   |   `-- pattern
@@ -971,7 +1766,7 @@ const BLASTS_AMORCE = null;
 
 /**
  * Peuple `cartes`, `blasts` et `blocs` depuis le dossier Drive.
- * Menu Run ▶ amorcerDepuisDrive. Le resultat est ecrit dans le journal.
+ * Menu Run â–¶ amorcerDepuisDrive. Le resultat est ecrit dans le journal.
  */
 function amorcerDepuisDrive() {
   const rapport = amorcer();
@@ -1099,7 +1894,7 @@ function amorcer() {
   return lignes.join('\n');
 }
 
-/** Nom de base d'un fichier : « plan_A1.jpg » -> « plan_A1 ». */
+/** Nom de base d'un fichier : Â« plan_A1.jpg Â» -> Â« plan_A1 Â». */
 function baseNom(nom) {
   const s = String(nom || '').trim();
   const point = s.lastIndexOf('.');
@@ -1157,7 +1952,7 @@ function decoderCarte(code) {
 
 /**
  * Reecrit un onglet : entete en ligne 1, puis les lignes fournies. Les
- * donnees precedentes de cet onglet sont remplacees — les autres onglets
+ * donnees precedentes de cet onglet sont remplacees â€” les autres onglets
  * ne sont jamais touches. Utilise par l'amorcage, jamais par le routage.
  *
  * `colonnesTexte` : noms de colonnes a forcer en format Texte brut (`@`)
@@ -1167,7 +1962,11 @@ function decoderCarte(code) {
  * et tronque la decimale a l'affichage, ecrasant des blasts distincts.
  */
 function ecrireTable(nom, entete, lignes, colonnesTexte) {
-  const sh = feuille(nom);
+  // Onglet absent : on le cree (entete posee ci-dessous) au lieu de lever
+  // Â« onglet manquant Â» â€” la migration dts -> flotte avait besoin de cela.
+  const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  let sh = ss.getSheetByName(nom);
+  if (!sh) sh = ss.insertSheet(nom);
   sh.clear();
   sh.getRange(1, 1, 1, entete.length).setValues([entete]).setFontWeight('bold');
   sh.setFrozenRows(1);
@@ -1204,10 +2003,10 @@ function ecrireTableOuLoge(nom, entete, lignes, colonnesTexte) {
 }
 
 // ============================================================
-//  AMORCAGE TEST — profils + equipements + dts + positions de test
+//  AMORCAGE TEST â€” profils + equipements + dts + positions de test
 // ============================================================
 //
-//  Menu Run ▶ semerReferentielsTest. Remplit `profils`, `equipements`,
+//  Menu Run â–¶ semerReferentielsTest. Remplit `profils`, `equipements`,
 //  `tab` et `positions` avec un jeu de donnees coherent, conforme aux
 //  regles de referentielsLire() :
 //   - chaque profil actif a au moins un equipement actif ;
@@ -1236,15 +2035,13 @@ function semerReferentiels() {
     ['SPOT',      'Spotter',                  'Spotter',     'SPOTTER',   'spot',      3, true],
   ];
 
-  const equipements = [
-    // Spotter : identifiant nominatif (pas de liste deroulante d'equipement,
-    // un seul champ = la personne elle-meme).
-    ['SPOT', 'Koffi Charles',  'Koffi Charles',  true],
-    ['SPOT', 'Edouard Grant',  'Edouard Grant',  true],
-    ['EXCAVATOR', 'EXCA-01', 'Excavatrice 01', true],
-    ['DT',        'DT-01',   'DT 01',          true],
-    ['DT',        'DT-02',   'DT 02',          true],
-  ];
+  // Identifiants (personnes) : laisse VIDE â€” les equipes et les membres
+  // se creent depuis l'app (Arborescence > Spotter > Teams), puis pousses
+  // vers cet onglet. Modele : profil | id | nom | role | equipe | actif.
+  const identifiants = [];
+
+  // Equipements = materiel GNSS/capteurs de la reserve, seede vide.
+  const equipements = [];
 
   const tab = [
     ['DT', 'TAB3-01', true],
@@ -1259,15 +2056,32 @@ function semerReferentiels() {
   ecrireTable(CONFIG.ONGLETS.PROFILS, SCHEMAS.profils, profils);
   lignes.push('profils : ' + profils.length + ' ligne(s).');
 
-  ecrireTable(CONFIG.ONGLETS.IDENTIFIANTS, SCHEMAS.identifiants, equipements);
-  lignes.push('identifiants : ' + equipements.length + ' ligne(s).');
+  ecrireTable(CONFIG.ONGLETS.IDENTIFIANTS, SCHEMAS.identifiants, identifiants);
+  lignes.push('identifiants : ' + identifiants.length + ' ligne(s).');
+
+  ecrireTable(CONFIG.ONGLETS.EQUIPEMENTS, SCHEMAS.equipements, equipements);
+  lignes.push('equipements : ' + equipements.length + ' ligne(s) (materiel GNSS).');
 
   ecrireTable(CONFIG.ONGLETS.TAB, SCHEMAS.tab, tab);
   lignes.push('tab : ' + tab.length + ' ligne(s).');
 
   ecrireTable(CONFIG.ONGLETS.POSITIONS, SCHEMAS.positions, positions);
   lignes.push('positions : ' + positions.length +
-              ' ligne(s) (DEPOT, DA1, DA2 — coordonnees UTM a ajuster).');
+              ' ligne(s) (DEPOT, DA1, DA2 â€” coordonnees UTM a ajuster).');
+
+  // Flotte : familles par ROLE (DT = camions, EXCAVATOR = excavatrice).
+  // La colonne `role` est la jointure — aucun dedans ni deduction.
+  const flotte = [];
+  let num = 1;
+  FLOTTE_ROLES.forEach((fr) => {
+    fr.familles.forEach((f) => {
+      for (let i = 0; i < f.nombre; i++) {
+        flotte.push({ role: fr.role, famille: f.code, numero: num++, actif: true });
+      }
+    });
+  });
+  ecrireTable(CONFIG.ONGLETS.FLOTTE, SCHEMAS.flotte, flotte);
+  lignes.push('flotte : ' + flotte.length + ' engin(s).');
 
   lignes.push('Referentiels de test semes. Verifiez via ?action=referentiels.');
   return lignes.join('\n');
@@ -1275,10 +2089,10 @@ function semerReferentiels() {
 
 
 // ============================================================
-//  PEUPLEMENT — flotte DT (familles + numeros non redondants)
+//  PEUPLEMENT â€” flotte DT (familles + numeros non redondants)
 // ============================================================
 //
-//  Menu Run ▶ semerFlotteDTPoint.
+//  Menu Run â–¶ semerFlotteDTPoint.
 //
 //  Remplit l'onglet `flotte` avec les trois familles de dameuses du site :
 //  les 1500, les 785 et les ADT.
@@ -1288,12 +2102,12 @@ function semerReferentiels() {
 //
 //  `famille` est la FAMILLE (`1500`, `785`, `ADT`) et `numero` est le NUMERO
 //  du camion, une simple suite de chiffres (`1`, `2`, `3`...). Cote client,
-//  la famille s'affiche « DT 1500 » et le numero « DT 5 ».
+//  la famille s'affiche Â« DT 1500 Â» et le numero Â« DT 5 Â».
 //
 //  LES NUMEROS NE SE REPETENT JAMAIS D'UNE FAMILLE A L'AUTRE : la
 //  numerotation est continue sur tout le parc. La 1500 prend 1..N1500,
 //  la 785 reprend a N1500+1, l'ADT reprend apres la 785. Un numero
-//  designe donc un camion unique, quelle que soit sa famille — c'est la
+//  designe donc un camion unique, quelle que soit sa famille â€” c'est la
 //  regle exigee cote formulaire (le second menu ne doit jamais proposer
 //  deux fois le meme numero).
 //
@@ -1301,17 +2115,23 @@ function semerReferentiels() {
 // ============================================================
 
 /**
- * Composition de la flotte. L'ordre du tableau fixe l'ordre des familles
- * dans les menus ET l'ordre de numerotation (numeros croissants, sans
- * trou, toutes familles confondues).
- *
- * `libelle` : texte affiche (le client ajoute « DT » devant le `code`).
- * `nombre`  : nombre de camions de cette famille.
+ * Composition de la flotte, RATTACHEE A SON ROLE : la colonne `role` de
+ * l'onglet `flotte` porte le profil proprietaire — aucune deduction par le
+ * nom de famille, la base est la source de verite.
  */
-const FLOTTE_DT = [
-  { code: '1500', libelle: 'DT 1500', nombre: 8 },
-  { code: '785',  libelle: 'DT 785',  nombre: 6 },
-  { code: 'ADT',  libelle: 'ADT',     nombre: 4 },
+const FLOTTE_ROLES = [
+  {
+    role: 'DT',
+    familles: [
+      { code: '1500', libelle: 'DT 1500', nombre: 8 },
+      { code: '785', libelle: 'DT 785', nombre: 6 },
+      { code: 'ADT', libelle: 'DT ADT', nombre: 4 },
+    ],
+  },
+  {
+    role: 'EXCAVATOR',
+    familles: [{ code: 'EXCAVATOR', libelle: 'EXCAVATOR', nombre: 1 }],
+  },
 ];
 
 /**
@@ -1329,37 +2149,39 @@ function semerFlotteDTPoint() {
  * (memes numeros, meme ordre). La numerotation est purement derivee de
  * FLOTTE_DT, sans aleatoire ni compteur persistant.
  *
- * ATTENTION : `ecrireTable` fait `sh.clear()` — les lignes saisies a la
+ * ATTENTION : `ecrireTable` fait `sh.clear()` â€” les lignes saisies a la
  * main dans `flotte` sont remplacees. Cet onglet ne porte que la flotte.
  */
 function semerFlotteDT() {
   // `ecrireTable` exige que l'onglet existe : sur un classeur neuf,
   // `flotte` n'est pas encore cree. `initialiser()` le cree (et applique
-  // son entete) avant toute ecriture — sans cela, un premier lancement
-  // echouerait sur « onglet manquant : flotte ».
+  // son entete) avant toute ecriture â€” sans cela, un premier lancement
+  // echouerait sur Â« onglet manquant : flotte Â».
   initialiser();
 
   const lignes = [];
   const rangees = [];
   let numero = 1;
 
-  for (const famille of FLOTTE_DT) {
-    const code = String(famille.code || '').trim();
-    const nombre = Number(famille.nombre) || 0;
-    if (!code || nombre < 1) {
-      lignes.push('IGNORE : famille invalide ' + JSON.stringify(famille));
-      continue;
+  for (const fr of FLOTTE_ROLES) {
+    for (const famille of fr.familles) {
+      const code = String(famille.code || '').trim();
+      const nombre = Number(famille.nombre) || 0;
+      if (!code || nombre < 1) {
+        lignes.push('IGNORE : famille invalide ' + JSON.stringify(famille));
+        continue;
+      }
+      // Chaque engin recoit le prochain numero du parc ; le `role` rattache
+      // la ligne a son profil (DT, EXCAVATOR...).
+      for (let i = 0; i < nombre; i++) {
+        rangees.push([fr.role, code, String(numero), true]);
+        numero++;
+      }
+      lignes.push(
+        famille.libelle + ' : ' + nombre + ' engin(s), numeros ' +
+        (numero - nombre) + ' a ' + (numero - 1)
+      );
     }
-    // Chaque camion de la famille recoit le prochain numero libre du parc :
-    // la numerotation ne repart jamais a 1 d'une famille a l'autre.
-    for (let i = 0; i < nombre; i++) {
-      rangees.push([code, String(numero), true]);
-      numero++;
-    }
-    lignes.push(
-      famille.libelle + ' : ' + nombre + ' camion(s), numeros ' +
-      (numero - nombre) + ' a ' + (numero - 1)
-    );
   }
 
   if (!rangees.length) {
@@ -1382,12 +2204,12 @@ function semerFlotteDT() {
 
 
 // ============================================================
-//  DIAGNOSTIC — ou sont reellement les donnees de la flotte ?
+//  DIAGNOSTIC â€” ou sont reellement les donnees de la flotte ?
 // ============================================================
 //
-//  Menu Run ▶ diagnostiquerOnglets
+//  Menu Run â–¶ diagnostiquerOnglets
 //
-//  A utiliser quand une ecriture semble « reussie » dans le journal mais
+//  A utiliser quand une ecriture semble Â« reussie Â» dans le journal mais
 //  que le contenu reste invisible a l'ecran. Le cas typique est un DOUBLON
 //  DE NOM D'ONGLET : Sheets n'interdit pas deux onglets nommes pareil dans
 //  des classeurs differents, et un onglet renomme `dts (1)` ne repond plus
@@ -1412,7 +2234,7 @@ function diagnostiquerOnglets() {
   for (const sh of ss.getSheets()) {
     const nom = sh.getName();
     // Entre chevrons pour rendre visibles les espaces parasites :
-    // « dts » et « dts » (avec un espace final) sont deux onglets distincts.
+    // Â« dts Â» et Â« dts Â» (avec un espace final) sont deux onglets distincts.
     lignes.push(
       '  <' + nom + '>  lignes=' + sh.getLastRow() +
       '  colonnes=' + sh.getLastColumn()
@@ -1446,7 +2268,7 @@ function diagnostiquerOnglets() {
 }
 
 // ============================================================
-//  STRUCTURATION — separation flotte / tab / equipements
+//  STRUCTURATION â€” separation flotte / tab / equipements
 // ============================================================
 //
 //  Ancien modele (confus) :
@@ -1471,7 +2293,7 @@ function diagnostiquerOnglets() {
 //  a la main. Chaque etape journalise son resultat.
 //
 //  Lancee par `initialiser()` a chaque appel HTTP. Declenchement manuel :
-//  Run ▶ migrerStructurationManuel
+//  Run â–¶ migrerStructurationManuel
 // ============================================================
 
 function migrerStructurationManuel() {
@@ -1503,24 +2325,29 @@ function migrerStructuration(ss, verbeux) {
   }
 
   // --- 2. flotte <- dts, puis tab vide ----------------------------------
+  // Peuple si `flotte` est ABSENTE ou VIDE (en-tete seule) : un
+  // redÃ©ploiement precedent a pu la creer vide avant la migration â€”
+  // sans cette condition, la flotte resterait a jamais vide.
   const flotte = ss.getSheetByName(CONFIG.ONGLETS.FLOTTE);
-  if (!flotte) {
+  if (!flotte || flotte.getLastRow() <= 1) {
     const ancienDts = ss.getSheetByName(CONFIG.ONGLETS.TAB_LEGACY);
-    if (ancienDts) {
+    if (ancienDts && ancienDts.getLastRow() > 1) {
       const lignes = ancienDts.getLastRow() > 1
         ? ancienDts.getDataRange().getValues().slice(1)
         : [];
       // Conversion du format historique : `type | id | actif`
-      //   type   -> la FAMILLE (ex. `1500`, `785`, `ADT`)
-      //   id     -> le NUMERO du camion (ex. `1`, `2`, ...)
-      // Une ligne dont le numero n'est pas un entier strictement positif
-      // est ignoree : elle ne representait pas un camion.
+      //   type   -> la FAMILLE (ex. `1500`, `785`, `ADT`, `EXCAVATOR`)
+      //   id     -> le NUMERO de l'engin (ex. `1`, `2`, ...)
+      // Le ROLE se deduit de la famille par l'ancienne regle: une famille
+      // EXCAVATOR appartient a EXCAVATOR, le reste a DT. Les ajouts ulterieurs
+      // de roles se feront directement dans l'onglet flotte.
       const rangees = [];
       for (const l of lignes) {
         const famille = String(l[0] || '').trim();
         const numero = String(l[1] || '').trim();
         if (!famille || !/^[0-9]+$/.test(numero)) continue;
-        rangees.push([famille, numero, true]);
+        const role = famille.toUpperCase() === 'EXCAVATOR' ? 'EXCAVATOR' : 'DT';
+        rangees.push([role, famille, numero, true]);
       }
       ecrireTableOuLoge(
         CONFIG.ONGLETS.FLOTTE, SCHEMAS.flotte, rangees,
@@ -1530,6 +2357,7 @@ function migrerStructuration(ss, verbeux) {
       // Les anciennes lignes de `dts` n'etaient PAS des tablettes (c'etait
       // la flotte). `tab` demarre donc vide : il recevra les vraies
       // tablettes a la main.
+      normaliserFlotte(ss, faits);
       const tab = ss.getSheetByName(CONFIG.ONGLETS.TAB);
       if (!tab) {
         const t = ss.insertSheet(CONFIG.ONGLETS.TAB);
@@ -1546,6 +2374,11 @@ function migrerStructuration(ss, verbeux) {
   // On ne le recree pas s'il a ete supprime : `initialiser()` s'en charge
   // avec son nouveau schema (materiel).
 
+  // L'onglet flotte EXISTANT est aussi normalise : colonne `role` ajoutee
+  // si absente, roles remplis, ligne EXCAVATOR garantie — sans intervention
+  // manuelle dans le Sheet (la SaaS commande, jamais l'operateur).
+  normaliserFlotte(ss, faits);
+
   if (faits.length) {
     const rapport = 'STRUCTURATION : ' + faits.join(' | ');
     journal(rapport);
@@ -1556,4 +2389,80 @@ function migrerStructuration(ss, verbeux) {
     return 'Rien a faire : <identifiants>, <flotte> et <tab> sont en place.';
   }
   return '';
+}
+
+/**
+ * Normalise l'onglet `flotte` en place : garantit le schéma
+ * `role | famille | numero | actif`, remplit les roles manquants et
+ * assure la presence d'au moins une ligne EXCAVATOR. Idempotent, aucune
+ * intervention manuelle dans le Sheet : c'est la SaaS qui commande.
+ *
+ * @param {Spreadsheet} ss classeur cible
+ * @param {string[]} faits liste de compte-rendus à alimenter
+ */
+function normaliserFlotte(ss, faits) {
+  let sh = ss.getSheetByName(CONFIG.ONGLETS.FLOTTE);
+  if (!sh) return;
+
+  // --- 1. Entête : garantir `role` en première colonne -------------------
+  const entete = (sh.getLastColumn()
+    ? sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0]
+        .map((v) => String(v).trim())
+    : []).filter((v) => v !== '');
+  const attendu = SCHEMAS.flotte;
+  let enteteModifiee = false;
+  if (entete[0] !== 'role') {
+    // Insertion de la colonne role en tête (les données suivent).
+    sh.insertColumnBefore(1);
+    entete.unshift('role');
+    enteteModifiee = true;
+  }
+  // Complete les autres colonnes manquantes (famille, numero, actif).
+  for (let i = 0; i < attendu.length; i++) {
+    if (entete[i] !== attendu[i]) {
+      if (entete.length <= i) entete.push(attendu[i]);
+      else entete[i] = attendu[i];
+      enteteModifiee = true;
+    }
+  }
+  if (enteteModifiee) {
+    sh.getRange(1, 1, 1, entete.length)
+      .setValues([entete]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+    faits.push('flotte : entête normalisée (' + entete.join(', ') + ')');
+  }
+
+  // --- 2. Données : lire, compléter les roles, réécrire ------------------
+  const dernieres = sh.getLastRow();
+  if (dernieres > 1) {
+    const lignes = sh.getRange(2, 1, dernieres - 1, entete.length).getValues();
+    let changes = 0;
+    for (const l of lignes) {
+      const famille = String(l[1] || '').trim();
+      const numero = String(l[2] || '').trim();
+      if (!famille || !numero) continue;
+      const roleAvant = String(l[0] || '').trim().toUpperCase();
+      if (roleAvant) continue;
+      // Deduction par la famille (ancien format migré) : EXCAVATOR reste
+      // EXCAVATOR, les familles numérotées (1500/785/ADD...) vont à DT.
+      l[0] = famille.toUpperCase().includes('EXCAVATOR') ? 'EXCAVATOR' : 'DT';
+      changes++;
+    }
+    if (changes) {
+      sh.getRange(2, 1, lignes.length, entete.length).setValues(lignes);
+      faits.push('flotte : ' + changes + ' role(s) complété(s)');
+    }
+  }
+
+  // --- 3. Garantir une ligne EXCAVATOR -----------------------------------
+  const rangeeExca = (dernieres > 1
+    ? sh.getRange(2, 1, dernieres - 1, Math.max(2, entete.length)).getValues()
+    : []).some((l) => String(l[0]).toUpperCase() === 'EXCAVATOR');
+  if (!rangeeExca) {
+    const ligne = ['EXCAVATOR', 'EXCAVATOR', '1', true]
+      .slice(0, entete.length);
+    while (ligne.length < entete.length) ligne.push('');
+    sh.appendRow(ligne);
+    faits.push('flotte : ligne EXCAVATOR ajoutée');
+  }
 }

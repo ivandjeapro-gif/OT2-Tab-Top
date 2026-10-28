@@ -22,12 +22,6 @@ class _SplashScreenState extends State<SplashScreen>
   late final AnimationController _controller;
   Timer? _timer;
 
-  /// Mode DEMONSTRATION (presentation offroad) : 5 taps rapides sur le logo
-  /// pendant le splash activent le scenario GPS simulé (sortie de parcours
-  /// en boucle, bip + vibration, bandeau rouge). Sans tap, demarrage normal.
-  int _taps = 0;
-  bool demoOffroad = false;
-
   /// Ouverture du fichier local (CDC §13) : lancee des le premier frame, de
   /// sorte que les 3 s de barre de progression servent aussi a charger la base.
   late final Future<void> _base;
@@ -43,17 +37,13 @@ class _SplashScreenState extends State<SplashScreen>
     _timer = Timer(const Duration(milliseconds: 3000), _suivant);
   }
 
-  /// 5 taps sur le logo = mode demo. La base est reouverte avec le scenario :
-  /// ouvrirBase remplace le service de position avant le premier ecran.
+  /// Le logo n'est plus interactif : le mode demo est debranche (demande du
+  /// 21/10 — « je ne veux aucun demo »). Un 5-taps accidentel avait active
+  /// le scenario fictif sur une tablette de production (GPS simule, alerte
+  /// « sortie de route » codee en dur). Le tap conserve uniquement le
+  /// deverrouillage audio web.
   void _tapLogo() {
-    // Premier tap = deverrouillage de l'audio du navigateur web : sans lui,
-    // Chrome/Edge rejettent speechSynthesis.speak() des alertes automatiques.
     widget.session.alerter.deverrouillerAudioWeb();
-    _taps++;
-    if (_taps >= 5 && !demoOffroad) {
-      demoOffroad = true;
-      _base.then((_) => widget.session.ouvrirBase(demoOffroad: true));
-    }
   }
 
   void _suivant() async {
@@ -99,7 +89,8 @@ class _SplashScreenState extends State<SplashScreen>
             children: [
               const Spacer(flex: 3),
               GestureDetector(
-                // Mode demo : 5 taps rapides sur le logo pendant le splash.
+                // Deverrouillage audio web au tap : la page ne joue un son
+                // qu'apres une interaction utilisateur (politique navigateur).
                 onTap: _tapLogo,
                 child: Image.asset(
                   'assets/images/logo_ore_tracking.png',
@@ -108,19 +99,6 @@ class _SplashScreenState extends State<SplashScreen>
                 ),
               ),
               const Spacer(flex: 4),
-              if (demoOffroad)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: 8),
-                  child: Text(
-                    'MODE DEMO OFFROAD',
-                    style: TextStyle(
-                      fontFamily: kSerif,
-                      fontWeight: FontWeight.w800,
-                      color: AppColors.red,
-                      fontSize: 16,
-                    ),
-                  ),
-                ),
               SizedBox(
                 // `.clamp(0, ...)` : sur une fenetre de largeur nulle (fenetre
                 // minimisée, premiere frame avant mesure), le produit tombe a 0

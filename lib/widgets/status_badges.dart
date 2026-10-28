@@ -346,6 +346,56 @@ class BleStatusBadge extends StatelessWidget {
   }
 }
 
+/// Boite d'etat du transport radio XBee (module USB-C vers la base fixe).
+///
+/// Ce n'est PAS un reseau : la tablette parle en 802.15.4 a UNE base, qui
+/// remonte ensuite au serveur. Le badge n'a donc aucun compteur de clients —
+/// juste « actif » quand le port serie est ouvert, « inactif » sinon.
+class XbeeStatusBadge extends StatelessWidget {
+  const XbeeStatusBadge({super.key, required this.etat, this.remplir = false});
+
+  /// Etat de la couche : inactif = port ferme, connecte = port ouvert.
+  final EtatCouche etat;
+
+  /// Vrai quand le badge est pose dans une colonne sans largeur imposee.
+  final bool remplir;
+
+  @override
+  Widget build(BuildContext context) {
+    final MiseEnPage mise = MiseEnPage.depuis(context);
+    final double k = mise.k;
+    final Color color = etat.couleur;
+    return _BoiteBadge(
+      taille: mise.tailleBadge,
+      couleur: color,
+      epaisseur: (3 * k).clamp(1.5, 3.0),
+      enfant: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Glyph radio : la meme famille que le Bluetooth/Wi-Fi, mais
+          // distincte a l'oeil pour ne pas confondre les trois transports.
+          Icon(Icons.settings_input_antenna,
+              size: (30 * k).clamp(15.0, 30.0), color: color),
+          SizedBox(height: (4 * k).clamp(2.0, 4.0)),
+          Text(
+            'XBee',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontFamily: kSerif,
+              fontSize: (13 * k).clamp(9.0, 13.0),
+              color: color,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+      remplir: remplir,
+    );
+  }
+}
+
 /// Boite d'etat de la couche Wi-Fi P2P DT <-> spotter (REQ-007/008).
 ///
 /// Distincte de [WifiStatusBadge] : celle-la montre l'etat du reseau local
@@ -606,6 +656,7 @@ class PointAccesStatusBadge extends StatelessWidget {
     required this.etat,
     this.ssid = '',
     this.remplir = false,
+    this.surTap,
   });
 
   final EtatCouche etat;
@@ -614,6 +665,12 @@ class PointAccesStatusBadge extends StatelessWidget {
   final String ssid;
 
   final bool remplir;
+
+  /// Appelé au tap sur le badge. Point d'entree pour « ouvrir les réglages
+  /// du partage » quand l'AP est inactif : l'operateur active le partage
+  /// systeme lui-meme (TETHER_PRIVILEGED n'est pas accordable aux apps,
+  /// refonte 21/10).
+  final VoidCallback? surTap;
 
   String get _libelle {
     if (etat != EtatCouche.connecte) return etat.libelle;
@@ -631,7 +688,7 @@ class PointAccesStatusBadge extends StatelessWidget {
     final MiseEnPage mise = MiseEnPage.depuis(context);
     final double k = mise.k;
     final Color color = etat.couleur;
-    return _BoiteBadge(
+    final Widget badge = _BoiteBadge(
       taille: mise.tailleBadge,
       couleur: color,
       epaisseur: (2 * k).clamp(1.0, 2.0),
@@ -660,5 +717,8 @@ class PointAccesStatusBadge extends StatelessWidget {
         ),
       ),
     );
+    // Tap du badge : seulement si un handler est fourni (les réglages du
+    // partage côté excavatrice).
+    return surTap == null ? badge : GestureDetector(onTap: surTap, child: badge);
   }
 }

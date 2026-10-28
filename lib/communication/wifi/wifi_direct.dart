@@ -142,6 +142,153 @@ class WifiDirect {
     }
   }
 
+  /// Force le trafic **serveur** sur la 4G.
+  ///
+  /// A appeler des qu'on rejoint le point d'acces de l'excavatrice : ce
+  /// reseau n'a pas Internet, donc Android y route tout et les appels vers
+  /// Apps Script echouent alors que la 4G est presente. Rend false si
+  /// l'appareil n'a pas de reseau cellulaire — la route par defaut est alors
+  /// conservee, et l'app continue de fonctionner en local.
+  static Future<bool> forcerCellulaire() async {
+    if (!_estAndroid) return false;
+    try {
+      final Map<Object?, Object?>? r =
+          await _canal.invokeMethod<Map<Object?, Object?>>('forcer_cellulaire');
+      return r?['ok'] == true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Rend la main a la route par defaut du systeme.
+  static Future<void> libererRoute() async {
+    if (!_estAndroid) return;
+    try {
+      await _canal.invokeMethod<Map<Object?, Object?>>('liberer_route');
+    } catch (_) {
+      // Sans consequence : le systeme reprend sa route a la fermeture.
+    }
+  }
+
+  /// Etat REEL de la radio cellulaire, lu directement chez Android.
+  ///
+  /// `connectivity_plus` resume le reseau en categories et **perd
+  /// l'information** quand un Wi-Fi secondaire est present : sur un portail
+  /// captif, il ne rend aucun reseau valide alors que la 4G est connectee.
+  /// D'ou ce badge juste sur le DT (sans Wi-Fi) et faux sur le spotter.
+  ///
+  /// Rend (actif, present) : `actif` = la 4G est le reseau par defaut ;
+  /// `present` = la 4G existe, meme masquee par un Wi-Fi.
+  static Future<({bool actif, bool present})> etatCellulaire() async {
+    if (!_estAndroid) return (actif: false, present: false);
+    try {
+      final Map<Object?, Object?>? r =
+          await _canal.invokeMethod<Map<Object?, Object?>>('etat_cellulaire');
+      return (
+        actif: r?['actif'] == true,
+        present: r?['present'] == true,
+      );
+    } catch (_) {
+      return (actif: false, present: false);
+    }
+  }
+
+  /// Active le **partage de connexion systeme** (excavatrice).
+  ///
+  /// Contrairement a `LocalOnlyHotspot`, il ne filtre pas le trafic entrant
+  /// des clients : c'est la seule voie qui laisse le DT joindre le serveur
+  /// TCP de l'excavatrice. Rend (ok, erreur) ; en cas d'echec, l'appelant
+  /// retombe sur le hotspot local.
+  static Future<({bool ok, String? erreur})> demarrerPartageConnexion() async {
+    if (!_estAndroid) return (ok: false, erreur: 'hors Android');
+    try {
+      final Map<Object?, Object?>? r =
+          await _canal.invokeMethod<Map<Object?, Object?>>('demarrer_partage');
+      final bool ok = r?['ok'] == true;
+      final Object? e = r?['erreur'];
+      return (ok: ok, erreur: e == null ? null : '$e');
+    } on MissingPluginException {
+      return (ok: false, erreur: 'canal natif absent');
+    } catch (e) {
+      return (ok: false, erreur: '$e');
+    }
+  }
+
+  /// Verifie que le point d'acces emet reellement, et le relance sinon.
+  ///
+  /// `reservation != null` ne suffit pas : Android peut fermer le point
+  /// d'acces sans prevenir (bascule Wi-Fi, economie d'energie), et
+  /// l'application continuait alors d'afficher un SSID que personne ne
+  /// pouvait voir. Rend l'etat constate apres la tentative.
+  static Future<bool> verifierHotspot() async {
+    if (!_estAndroid) return false;
+    try {
+      final Map<Object?, Object?>? r =
+          await _canal.invokeMethod<Map<Object?, Object?>>('verifier_hotspot');
+      return r?['emet'] == true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Le partage de connexion SYSTEME est-il deja actif (active par
+  /// l'operateur dans les Reglages) ?
+  ///
+  /// Refonte 21/10 : `TETHER_PRIVILEGED` n'est pas accordable aux apps
+  /// ordinaires, donc l'application ne peut pas ouvrir le partage elle-meme
+  /// sur Android 15. En revanche elle DETECTE le partage active par
+  /// l'operateur (interface `ap0`) et l'UTILISE : contrairement au
+  /// `LocalOnlyHotspot`, le partage systeme ne filtre pas les clients, le
+  /// TCP de l'excavatrice devient joignable.
+  ///
+  /// Rend (actif, adresse, ssid, motDePasse) : `adresse` est celle que les
+  /// clients joignent en TCP ; `ssid`/`motDePasse` sont la config REELLE du
+  /// partage, a provisionner au DT par BLE.
+  static Future<PartageActif?> partageActif() async {
+    if (!_estAndroid) return null;
+    try {
+      final Map<Object?, Object?>? r =
+          await _canal.invokeMethod<Map<Object?, Object?>>('partage_actif');
+      if (r == null || r['actif'] != true) return null;
+      final Map<Object?, Object?> config =
+          (r['config'] as Map?)?.cast<Object?, Object?>() ?? const <Object?, Object?>{};
+      return PartageActif(
+        adresse: r['adresse']?.toString() ?? '',
+        ssid: config['ssid']?.toString() ?? '',
+        motDePasse: config['motDePasse']?.toString() ?? '',
+      );
+    } on MissingPluginException {
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Ouvre les Reglages Android du point d'acces, pour que l'operateur
+  /// active le partage lui-meme (une seule fois — Android le memorise).
+  static Future<void> ouvrirReglagesPartage() async {
+    if (!_estAndroid) return;
+    try {
+      await _canal.invokeMethod<void>('ouvrir_reglages_partage');
+    } catch (_) {
+      // Rien : l'operateur ouvre les reglages a la main si l'intention echoue.
+    }
+  }
+
+  /// Adresse IPv4 du point d'acces, ou null s'il n'emet pas.
+  static Future<String?> adressePointAcces() async {
+    if (!_estAndroid) return null;
+    try {
+      final Map<Object?, Object?>? r =
+          await _canal.invokeMethod<Map<Object?, Object?>>('etat');
+      final Object? a = r?['adresseGroupOwner'];
+      if (r?['actif'] != true || a == null) return null;
+      return '$a';
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// Rejoint le point d'acces de l'excavatrice, avec les identifiants qu'elle
   /// a annonces (SSID et mot de passe attribues par Android).
   ///
@@ -226,6 +373,35 @@ class WifiDirect {
       return const <String>[];
     }
   }
+}
+
+/// Identifiants fixes du partage de connexion systeme.
+///
+/// Ils sont **choisis** par l'application (contrairement a `LocalOnlyHotspot`,
+/// qui les tire au hasard) : ils dupliquent `PartageConnexion.SSID` et
+/// `MOT_DE_PASSE` cote Kotlin, et servent aussi de repli quand le partage
+/// aboutit mais que l'adresse n'est pas encore disponible.
+abstract final class PartageConnexionSsid {
+  PartageConnexionSsid._();
+
+  static const String ssid = 'ORE-EXC';
+  static const String motDePasse = 'oretracking';
+}
+
+/// Partage de connexion systeme constate actif (active par l'operateur).
+class PartageActif {
+  const PartageActif({
+    required this.adresse,
+    required this.ssid,
+    required this.motDePasse,
+  });
+
+  /// IP de l'interface `ap0` : celle que les clients joignent en TCP.
+  final String adresse;
+
+  /// Config reelle du partage (lisible depuis Android 12).
+  final String ssid;
+  final String motDePasse;
 }
 
 /// Resultat d'un demarrage de reseau local (hotspot ou Wi-Fi Direct).

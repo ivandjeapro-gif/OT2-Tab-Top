@@ -4,6 +4,28 @@
          production n'aurait aucun reseau : les debug overlays ne suffisent pas. -->
     <uses-permission android:name="android.permission.INTERNET"/>
 
+    <!-- Etat du reseau (4G / Wi-Fi).
+         Sans cette permission, `connectivity_plus` ne peut pas interroger le
+         systeme : il rend une liste vide ou partielle, et le badge 4G ne
+         change jamais en cours d'execution. Permission normale, accordee a
+         l'installation. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+
+    <!-- Route reseau forcee sur la 4G (voir RouteReseau.kt).
+         `requestNetwork` + `bindProcessToNetwork` exigent cette permission :
+         sans elle, ConnectivityService leve SecurityException, la route n'est
+         jamais posee, et le trafic serveur reste bloque sur le point d'acces
+         local (qui n'a pas d'Internet). Permission normale. -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE"/>
+
+    <!-- Partage de connexion systeme (voir PartageConnexion.kt).
+         Contrairement a `LocalOnlyHotspot`, il ne filtre pas le trafic
+         entrant de l'hote : les clients peuvent joindre le serveur TCP de
+         l'excavatrice. `TETHER_PRIVILEGED` est reserve aux apps systeme mais
+         certains fabricants l'accordent ; a defaut, l'app retombe sur
+         LocalOnlyHotspot. -->
+    <uses-permission android:name="android.permission.TETHER_PRIVILEGED"/>
+
     <!-- Alerte hors-parcours (echec de trajet) : vibration du device a
          chaque mesure GPS pendant l'alerte. Permission normale, accordee
          a l'installation. -->
@@ -50,6 +72,15 @@
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
         android:usesPermissionFlags="neverForLocation"/>
     <uses-feature android:name="android.hardware.wifi.direct" android:required="false"/>
+
+    <!-- XBee + GNSS u-blox sur cable USB-C (kit ArduSimple) : acces port serie
+         via UsbManager natif. Permission normale, accordee a l'installation ;
+         `required="false"` car une tablette du parc peut tourner en BLE ou en
+         hotspot seul. Sans cette declaration, l'APK est installe mais
+         usb_serial ne peut PAS ouvrir le device (SecurityException silencieuse
+         du plugin : la couche XBee reste muette sans diagnostic net). -->
+    <uses-permission android:name="android.permission.USB"/>
+    <uses-feature android:name="android.hardware.usb.host" android:required="false"/>
 
     <application
         android:label="ore_tracking"

@@ -76,6 +76,10 @@ dependencies:
   # Android 12+ meme si le manifeste les declare : elles sont runtime.
   permission_handler: ^11.3.1
   flutter_tts: ^4.2.5
+  # Port serie USB (XBee + GNSS u-blox sur un seul cable USB-C, kit ArduSimple).
+  # Le plugin parle a UsbManager natif d'Android ; c'est le seul adapter USB
+  # serie maintenu sur pub.dev qui couvre le protocole CDC-ACM du XBee.
+  usb_serial: ^0.5.2
   # NOTE: `package:web` (Web Speech API) est volontairement absent des
   # dependencies classiques : il casse la compilation Android/iOS/Windows
   # (import de dart:js_interop). Voir alerter.dart : l'import est

@@ -195,6 +195,17 @@ class WifiClientManager(private val context: Context) {
     /**
      * Depose une suggestion de reseau (Android 10+) : le systeme memorise le
      * point d'acces et s'y reconnecte de lui-meme aux fois suivantes.
+     *
+     * POURQUOI `setIsMetered(false)` ET `setIsHiddenSsid(false)` :
+     * Android note les reseaux et donne un malus ecrasant a celui qui n'a pas
+     * d'Internet quand la 4G ou un autre Wi-Fi est disponible. Le hotspot de
+     * l'excavatrice n'a par nature AUCUN acces Internet : Android s'y
+     * connectait (RSSI -25 dBm) puis s'en deconnectait 0,5 s plus tard avec
+     * `CMD_UNWANTED_NETWORK` et `score=0` (mesure du 22/10).
+     *
+     * `isMetered = false` declare le reseau NON FACTURE : Android cesse de le
+     * considerer comme une voie Internet concurrente, donc de le penaliser.
+     * C'est la correction durable du va-et-vient entre hotspot et 4G.
      */
     fun memoriser(ssid: String, motDePasse: String): Boolean {
         val w = wifi ?: return false
@@ -205,7 +216,14 @@ class WifiClientManager(private val context: Context) {
                 .setSsid(ssid)
                 .setWpa2Passphrase(motDePasse)
                 .setIsAppInteractionRequired(false)
+                // Reseau non facture : il ne doit jamais etre prefere a la 4G
+                // pour le trafic Internet, mais Android ne le deconnecte plus
+                // sous pretexte qu'il n'en a pas.
+                .setIsMetered(false)
                 .build()
+            // Remplace d'abord l'ancienne suggestion (meme SSID, autre cle) :
+            // sans ce retrait, Android garde la premiere et ignore la MAJ.
+            try { w.removeNetworkSuggestions(listOf(suggestion)) } catch (_: Exception) {}
             w.addNetworkSuggestions(listOf(suggestion)) ==
                 WifiManager.STATUS_NETWORK_SUGGESTIONS_SUCCESS
         } catch (e: Exception) {

@@ -4,7 +4,6 @@ import '../state/session.dart';
 import '../theme/app_theme.dart';
 import '../theme/responsive.dart';
 import '../widgets/profile_shell.dart';
-import '../widgets/voyants_entete.dart';
 import '../widgets/carte_suivi.dart';
 import '../widgets/status_badges.dart';
 
@@ -16,9 +15,11 @@ class DtScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Pas de voyants dans le bandeau pour ce profil : ils restent dans le
+    // corps de l'ecran, a taille pleine (voir `_TopBar`). Seul le spotter,
+    // dont l'ecran est etroit, les porte dans le bandeau.
     return ProfileShell(
       session: session,
-      voyants: ProfilVoyants.dt,
       body: ListenableBuilder(
         listenable: session,
         builder: (context, _) {
@@ -55,11 +56,8 @@ class DtScreen extends StatelessWidget {
                       child: IntrinsicHeight(
                         child: Column(
                           children: [
-                            // Les voyants sont passes au bandeau du haut
-                            // (`ProfileShell.voyants`) ; cette barre ne garde
-                            // que le nom de l'equipement.
                             _TopBar(session: session),
-                            SizedBox(height: 12 * mise.k),
+                            SizedBox(height: 16 * mise.k),
                             Expanded(
                               // Sous 760 px de large, deux colonnes cote a cote
                               // laissent une carte illisible : la carte passe
@@ -217,10 +215,9 @@ class _Valeurs extends StatelessWidget {
         // chose : ce libelle evite de prendre ce quelque chose pour un
         // releve de site.
         Text(
-          session.positionFiable
-              ? 'Source : GNSS externe'
-              : 'Source : ${session.libelleSourcePosition}'
-                  ' - releve non exploitable',
+          'Source : ${session.positionFiable
+              ? 'GNSS externe'
+              : session.libelleSourcePosition}',
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
           style: TextStyle(
@@ -241,17 +238,14 @@ class _Valeurs extends StatelessWidget {
               'Northing',
               'Elevation',
             ],
-            // Valeurs GNSS reelles ou « — ». Un tiret est HONNETE : il vaut
-            // mieux dire « je ne sais pas » qu'afficher une coordonnee
-            // fausse. Trois cas donnent le tiret :
-            //  - aucune mesure (acquisition en cours, service arrete) ;
-            //  - mesure issue du capteur INTERNE de la tablette, qui peut
-            //    etre deduite du Wi-Fi ou du reseau mobile et se tromper de
-            //    plusieurs centaines de metres — inacceptable pour un DT
-            //    qui doit rejoindre une dumping area ;
-            //  - source inconnue.
-            // Seul un recepteur GNSS externe remplit ces colonnes.
-            values: !session.positionFiable
+            // Valeurs reelles ou « — ». Le tiret couvre deux cas : aucune
+            // mesure (acquisition en cours, service arrete) ou mesure
+            // inexistante. Avec « GPS Android » (source interne) on affiche
+            // maintenant les valeurs obtenues : le test terrain exige de
+            // voir quelque chose, et la source reste signalée par le
+            // libellé ci-dessus. Seule une source externe (GNSS) garantit
+            // un releve de chantier.
+            values: session.easting == null
                 ? const ['—', '—', '—']
                 : [
                     '${session.easting}',
@@ -378,11 +372,15 @@ class _TopBar extends StatelessWidget {
   Widget build(BuildContext context) {
     final double k = MiseEnPage.depuis(context).k;
 
-    // Les quatre voyants sont passes dans le bandeau du haut, communs aux
-    // trois profils : ici ne reste que le nom, qui dispose de toute la
-    // largeur et peut donc etre lu de loin.
+    // Voyants d'origine, sous le bandeau, a taille pleine : 4G a gauche du
+    // nom, puis BLE, Wi-Fi et GPS a droite. Seul le spotter, dont l'ecran est
+    // etroit, les porte dans le bandeau du haut.
     return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
       children: [
+        // Reseau externe (vers le serveur) : la 4G.
+        GsmStatusBadge(etat: session.etat4GAffiche),
+        SizedBox(width: 10 * k),
         Expanded(
           child: Center(
             child: FittedBox(
@@ -401,8 +399,7 @@ class _TopBar extends StatelessWidget {
             ),
           ),
         ),
-        // Test de la voix off, conserve : il n'a pas sa place dans le
-        // bandeau (c'est une action, pas un voyant).
+        // Test de la voix off : une action, pas un voyant.
         IconButton(
           tooltip: 'Tester la voix off',
           icon: Icon(Icons.volume_up, size: 26 * k, color: AppColors.ink),
@@ -412,6 +409,30 @@ class _TopBar extends StatelessWidget {
                 .dire('Test de la voix off, alerte trajet operationnelle');
           },
         ),
+        SizedBox(width: 8 * k),
+        // Meme regle que le bandeau (voyants_entete) : un transport decoche
+        // n'existe pas a l'ecran. Sans ces conditions, la barre du DT
+        // continuait d'afficher BLE et Wi-Fi meme avec « XBee seul » coche.
+        if (session.transportBleActif) ...[
+          BleStatusBadge(
+            etat: session.etatBleAffiche,
+            nombreClients: session.liensBle,
+          ),
+          SizedBox(width: 10 * k),
+        ],
+        if (session.transportXbeeActif) ...[
+          XbeeStatusBadge(etat: session.etatXbeeAffiche),
+          SizedBox(width: 10 * k),
+        ],
+        if (session.transportHotspotActif &&
+            !session.transportPrioritaireActif) ...[
+          WifiP2pStatusBadge(
+            etat: session.etatWifiAffiche,
+            nombreClients: session.liensWifi,
+          ),
+          SizedBox(width: 10 * k),
+        ],
+        GpsStatusBadge(etat: session.etatGpsAffiche),
       ],
     );
   }

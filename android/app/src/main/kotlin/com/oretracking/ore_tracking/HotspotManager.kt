@@ -209,13 +209,47 @@ class HotspotManager(private val context: Context) {
     /** Etat tel que la couche applicative l'affiche et le journalise. */
     fun etat(): Map<String, Any?> = mapOf(
         "disponible" to estDisponible(),
-        "actif" to (reservation != null),
+        // `actif` ne dit pas la verite a lui seul : la reservation peut
+        // survivre alors que l'interface reseau a disparu (Android ferme le
+        // point d'acces sans prevenir, ou le Wi-Fi bascule). Un hotspot
+        // « actif » sans adresse n'emet rien : les clients ne peuvent pas le
+        // trouver. On exige les deux.
+        "actif" to (reservation != null && adresseHotspot() != null),
+        "reservation" to (reservation != null),
         "ssid" to ssidActuel,
         "motDePasse" to motDePasseActuel,
         // IP de l'interface du point d'acces : c'est elle que les clients
         // doivent joindre pour le TCP applicatif.
         "adresseGroupOwner" to adresseHotspot(),
     )
+
+    /**
+     * Le point d'acces emet-il vraiment ?
+     *
+     * C'est la seule question qui compte pour un client : si l'interface n'a
+     * pas d'adresse, aucun SSID n'est diffuse, quoi qu'affiche l'application.
+     * Sert a la boucle de surveillance : un `false` declenche une relance.
+     */
+    fun emet(): Boolean = adresseHotspot() != null
+
+    /**
+     * Ferme la reservation sans attendre de compte rendu.
+     *
+     * Utilisee par la relance : une reservation fantome doit etre liberee
+     * avant d'en ouvrir une nouvelle, sinon Android refuse la seconde.
+     */
+    fun libererReservation() {
+        val r = reservation
+        reservation = null
+        ssidActuel = null
+        motDePasseActuel = null
+        try {
+            r?.close()
+            Log.i(TAG, "Reservation liberee avant relance")
+        } catch (e: Exception) {
+            Log.w(TAG, "Liberation de la reservation : ${e.message}")
+        }
+    }
 
     /**
      * Adresse IPv4 de l'interface du point d'acces.

@@ -106,7 +106,25 @@ class _SpotterScreenState extends State<SpotterScreen> {
 
     // Le type est choisi en premier, puis le numero dans le lot de ce type :
     // les deux listes sont liees, pas independantes.
-    String typeChoisi = session.base.typesDT.first.code;
+    //
+    // Seules les familles du profil DT (1500, 785, ADT…) sont proposees :
+    // `typesDT` contient TOUTES les familles du referentiel, excavateurs
+    // compris (HYUNDAI, VOLVO, PC…). Les afficher laissait choisir un
+    // excavateur comme destination d'une ligne de tir (observe 26/10).
+    final Profil? profilDT = session.base.profilDuRole(BaseLocale.roleTab2);
+    final Set<String> codesDT = profilDT == null
+        ? <String>{}
+        : session.base.famillesDuProfil(profilDT).toSet();
+    // Repli : sans reference profil/famille, on garde l'ancien comportement
+    // (toutes les familles) plutot que de bloquer la saisie.
+    final List<TypeDT> famillesDT = codesDT.isEmpty
+        ? session.base.typesDT
+        : <TypeDT>[
+            for (final TypeDT t in session.base.typesDT)
+              if (codesDT.contains(t.code)) t,
+          ];
+    if (famillesDT.isEmpty) return;
+    String typeChoisi = famillesDT.first.code;
     String? idDtChoisi;
 
     final bool? saved = await showDialog<bool>(
@@ -342,7 +360,8 @@ class _SpotterScreenState extends State<SpotterScreen> {
                     border: OutlineInputBorder(),
                   ),
                   items: [
-                    for (final TypeDT option in session.base.typesDT)
+                    // Uniquement les familles d'engins du profil DT.
+                    for (final TypeDT option in famillesDT)
                       DropdownMenuItem<String>(
                         value: option.code,
                         // La famille porte deja son prefixe (« DT 1500 »,
@@ -1319,18 +1338,6 @@ class _ImagePlan extends StatelessWidget {
                                     color: Colors.white70,
                                   ),
                                 ),
-                              // Diagnostic TEMPORAIRE : montre la source
-                              // reellement chargee (ID Drive ou chemin local).
-                              // A retirer une fois le multi-RL valide.
-                              Text(
-                                'src: ${widget.chemin}',
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  fontSize: (9 * k).clamp(8.0, 10.0),
-                                  color: Colors.amberAccent,
-                                ),
-                              ),
                             ],
                           ),
                         ),
